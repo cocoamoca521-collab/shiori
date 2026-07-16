@@ -1026,6 +1026,38 @@ function App() {
     return { screen: "entrance" };
   }
 
+  // 深い階層への遷移はhistoryに1段積む。玄関で戻るを押したときだけ
+  // 通常のブラウザ挙動(アプリ終了)に任せられるよう、玄関は積まずreplaceする。
+  function navigate(nextRoute) {
+    setRoute(nextRoute);
+    window.history.pushState(nextRoute, "");
+  }
+
+  // 上の階層に戻る操作は常にhistory.back()を経由させる。
+  // これでパンくずタップとAndroidの戻るボタンが同じ結果になる。
+  function goBack() {
+    window.history.back();
+  }
+
+  useEffect(() => {
+    if (route.screen === "conversation") {
+      window.history.replaceState({ screen: "entrance" }, "");
+      window.history.pushState({ screen: "rooms", buildingId: route.buildingId }, "");
+      window.history.pushState({ screen: "threads", buildingId: route.buildingId, roomId: route.roomId }, "");
+      window.history.pushState(route, "");
+    } else {
+      window.history.replaceState(route, "");
+    }
+  }, []);
+
+  useEffect(() => {
+    function handlePopState(e) {
+      setRoute(e.state || { screen: "entrance" });
+    }
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(K.theme, theme);
@@ -1056,7 +1088,7 @@ function App() {
       <SettingsScreen
         apiKey={apiKey}
         theme={theme}
-        onBack={() => setRoute({ screen: "entrance" })}
+        onBack={goBack}
         onSaveApiKey={(key) => { localStorage.setItem(K.apiKey, key); setApiKey(key); }}
         onDeleteApiKey={() => { localStorage.removeItem(K.apiKey); setApiKey(""); }}
         onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
@@ -1073,7 +1105,7 @@ function App() {
       <MemoriesScreen
         room={room}
         memories={memories.filter((m) => m.roomId === room.id)}
-        onBack={() => setRoute({ screen: "threads", buildingId: room.buildingId, roomId: room.id })}
+        onBack={goBack}
         onDeleteMemory={(id) => setMemories(memories.filter((m) => m.id !== id))}
       />
     );
@@ -1087,11 +1119,11 @@ function App() {
         room={room}
         thread={thread}
         memories={memories}
-        onBack={() => setRoute({ screen: "threads", buildingId: building.id, roomId: room.id })}
+        onBack={goBack}
         onUpdateThread={(updated) => {
           setThreads(threads.map((t) => (t.id === updated.id ? updated : t)));
         }}
-        onOpenMemories={() => setRoute({ screen: "memories", buildingId: building.id, roomId: room.id })}
+        onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
         onOpenBundleMemory={async () => {
           const transcript = thread.messages
             .map((m) => `${m.role === "user" ? "多恵子" : "あなた"}: ${extractPlainText(m.content)}`)
@@ -1120,10 +1152,10 @@ function App() {
         building={building}
         room={room}
         threads={roomThreads}
-        onBack={() => setRoute({ screen: "rooms", buildingId: building.id })}
+        onBack={goBack}
         onOpenThread={(threadId) => {
           localStorage.setItem(K.lastThreadId, threadId);
-          setRoute({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId });
+          navigate({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId });
         }}
         onCreateThread={() => {
           const ts = nowISO();
@@ -1131,7 +1163,7 @@ function App() {
           const newThread = { id: uid(), roomId: room.id, title: label, createdAt: ts, frozenDate: label, messages: [] };
           setThreads([...threads, newThread]);
           localStorage.setItem(K.lastThreadId, newThread.id);
-          setRoute({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId: newThread.id });
+          navigate({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId: newThread.id });
         }}
         onRenameThread={(threadId, title) => {
           setThreads(threads.map((t) => (t.id === threadId ? { ...t, title } : t)));
@@ -1141,7 +1173,7 @@ function App() {
           setMemories(memories); // 記録帳はスレッド削除では消えない(部屋単位のため)
           if (localStorage.getItem(K.lastThreadId) === threadId) localStorage.removeItem(K.lastThreadId);
         }}
-        onOpenMemories={() => setRoute({ screen: "memories", buildingId: building.id, roomId: room.id })}
+        onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
       />
     );
   }
@@ -1152,8 +1184,8 @@ function App() {
       <RoomsScreen
         building={building}
         rooms={buildingRooms}
-        onBack={() => setRoute({ screen: "entrance" })}
-        onOpenRoom={(roomId) => setRoute({ screen: "threads", buildingId: building.id, roomId })}
+        onBack={goBack}
+        onOpenRoom={(roomId) => navigate({ screen: "threads", buildingId: building.id, roomId })}
         onCreateRoom={(data) => {
           const newRoom = { id: uid(), buildingId: building.id, ...data, createdAt: nowISO() };
           setRooms([...rooms, newRoom]);
@@ -1178,8 +1210,8 @@ function App() {
       buildings={buildings}
       theme={theme}
       onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-      onOpenBuilding={(buildingId) => setRoute({ screen: "rooms", buildingId })}
-      onOpenSettings={() => setRoute({ screen: "settings" })}
+      onOpenBuilding={(buildingId) => navigate({ screen: "rooms", buildingId })}
+      onOpenSettings={() => navigate({ screen: "settings" })}
       onCreateBuilding={(data) => {
         const newBuilding = { id: uid(), ...data, createdAt: nowISO() };
         setBuildings([...buildings, newBuilding]);
