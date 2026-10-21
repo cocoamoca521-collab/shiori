@@ -139,6 +139,7 @@
   .msg-loading { color: var(--rule); font-style: italic; }
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent); }
+  .usage-line { color: var(--rule); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
 
   .composer { border-top: 1px solid var(--rule); padding-top: 16px; margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
   .composer textarea { min-height: 72px; resize: vertical; }
@@ -633,6 +634,7 @@ function RoomFormModal({ room, onCancel, onSave }) {
   const [name, setName] = useState(room ? room.name : "");
   const [systemPrompt, setSystemPrompt] = useState(room ? room.systemPrompt : "");
   const [webSearch, setWebSearch] = useState(room ? room.webSearch : false);
+  const [cacheTtl, setCacheTtl] = useState(room && room.cacheTtl === "1h" ? "1h" : "5m");
 
   return (
     <div className="overlay" onClick={onCancel}>
@@ -655,12 +657,35 @@ function RoomFormModal({ room, onCancel, onSave }) {
           />
           <label htmlFor="websearch-toggle" style={{ margin: 0 }}>ウェブ検索を有効にする</label>
         </div>
+        <div className="field">
+          <label>記憶の栞（キャッシュ寿命）</label>
+          <div className="toggle-row">
+            <input
+              type="radio"
+              name="cache-ttl"
+              id="cache-ttl-5m"
+              checked={cacheTtl === "5m"}
+              onChange={() => setCacheTtl("5m")}
+            />
+            <label htmlFor="cache-ttl-5m" style={{ margin: 0 }}>5分 — こまめに話すとき</label>
+          </div>
+          <div className="toggle-row">
+            <input
+              type="radio"
+              name="cache-ttl"
+              id="cache-ttl-1h"
+              checked={cacheTtl === "1h"}
+              onChange={() => setCacheTtl("1h")}
+            />
+            <label htmlFor="cache-ttl-1h" style={{ margin: 0 }}>1時間 — 間をあけて話すとき（書き込み料金は2倍、読み出しは同じ）</label>
+          </div>
+        </div>
         <div className="modal-actions">
           <button onClick={onCancel}>やめる</button>
           <button
             className="accent"
             disabled={!name.trim()}
-            onClick={() => onSave({ name: name.trim(), systemPrompt, webSearch })}
+            onClick={() => onSave({ name: name.trim(), systemPrompt, webSearch, cacheTtl })}
           >
             保存する
           </button>
@@ -773,6 +798,18 @@ function MessageContent({ content }) {
   );
 }
 
+// モデル発言の下に出すキャッシュ状況の一行。usageの無い過去メッセージには何も出さない。
+function UsageLine({ usage }) {
+  if (!usage) return null;
+  const fmt = (n) => (n || 0).toLocaleString();
+  const read = usage.cache_read_input_tokens || 0;
+  const created = usage.cache_creation_input_tokens || 0;
+  const text = read > 0 || created > 0
+    ? `栞 ─ 読 ${fmt(read)} ・ 書 ${fmt(created)} ・ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`
+    : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
+  return <div className="usage-line">{text}</div>;
+}
+
 function ConversationScreen({
   apiKey, building, room, thread, memories,
   onBack, onUpdateThread, onOpenBundleMemory, onOpenMemories,
@@ -800,12 +837,29 @@ function ConversationScreen({
     setSending(true);
 
     try {
-      const block1 = { type: "text", text: room.systemPrompt, cache_control: { type: "ephemeral" } };
-      const block2 = { type: "text", text: buildBlock2(room, memories, thread.frozenDate), cache_control: { type: "ephemeral" } };
+      // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・最終メッセージの計3つ）
+      const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
+      const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
+      const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
+      const block2 = { type: "text", text: buildBlock2(room, memories, thread.frozenDate), cache_control: cc };
       const tools = room.webSearch
         ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
         : undefined;
-      const payloadMessages = nextMessages.map((m) => ({ role: m.role, content: m.content }));
+      const payloadMessages = nextMessages.map((m, i) => {
+        if (i !== nextMessages.length - 1) {
+          return { role: m.role, content: m.content };
+        }
+        // 最後のメッセージ（送信したばかりのユーザー発言）にキャッシュ境界を置く。保存形式は変えない。
+        if (typeof m.content === "string") {
+          return { role: m.role, content: [{ type: "text", text: m.content, cache_control: cc }] };
+        }
+        // 防御的処理：万一配列だった場合は最後のtextブロックに付与
+        const content = m.content.map((b) => ({ ...b }));
+        for (let j = content.length - 1; j >= 0; j--) {
+          if (content[j].type === "text") { content[j].cache_control = cc; break; }
+        }
+        return { role: m.role, content };
+      });
 
       const json = await callModel({
         building,
@@ -815,7 +869,7 @@ function ConversationScreen({
         tools,
       });
 
-      const assistantMessage = { role: "assistant", content: json.content, ts: nowISO() };
+      const assistantMessage = { role: "assistant", content: json.content, ts: nowISO(), usage: json.usage };
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
     } catch (e) {
       setError(e);
@@ -868,6 +922,7 @@ function ConversationScreen({
         {thread.messages.map((m, i) => (
           <div className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}`} key={i}>
             <MessageContent content={m.content} />
+            {m.role === "assistant" && <UsageLine usage={m.usage} />}
           </div>
         ))}
         {sending && (
