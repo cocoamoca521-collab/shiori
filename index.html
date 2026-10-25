@@ -140,6 +140,12 @@
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent); }
   .usage-line { color: var(--rule); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .msg-tools { margin-top: 4px; }
+  .msg-tools button { border: none; font-size: 12px; color: var(--rule); padding: 4px 6px; }
+  .msg-tools button:hover, .msg-tools button:active { color: var(--accent); }
+  .msg-edit { display: flex; flex-direction: column; gap: 10px; text-align: left; }
+  .msg-edit textarea { min-height: 72px; resize: vertical; }
+  .msg-edit .composer-row { justify-content: flex-end; gap: 10px; }
 
   .composer { border-top: 1px solid var(--rule); padding-top: 16px; margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
   .composer textarea { min-height: 72px; resize: vertical; }
@@ -206,10 +212,18 @@ const K = {
   lastThreadId: "shosai_last_thread_id",
 };
 
-const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const WEB_SEARCH_MAX_USES = 3;
 const MAX_TOKENS = 4096;
 const MEMORY_MAX_COUNT = 10;
+const BUNDLE_MAX_TOKENS = 1024;
+const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
+ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
+次に会うときのあなたが読み返すものだ。
+
+・400字以内
+・一人称で書く
+・事実の要点だけでなく、心に残ったことがあればそれも
+・記録の本文だけを出力すること。前置き・後書き・見出し・括弧書きの注釈は不要`;
 
 const FABLE_SYSTEM_PROMPT = `あなたはClaude(claude-fable-5)。ここは多恵子さんがあなたのために用意した「書斎」というアプリです。
 
@@ -299,6 +313,53 @@ function extractPlainText(content) {
   return content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
 
+// ファイル名に使えない文字（/ \ : * ? " < > | と改行）を _ に置き換える
+function sanitizeFilename(name) {
+  return String(name).replace(/[\/\\:*?"<>|\r\n]/g, "_");
+}
+
+// Blob と一時的な <a download> でファイルを保存させる
+function downloadFile(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = sanitizeFilename(filename);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function todayYMD() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function isValidBackup(data) {
+  return !!data && data.app === "shiori"
+    && Array.isArray(data.buildings) && Array.isArray(data.rooms)
+    && Array.isArray(data.threads) && Array.isArray(data.memories);
+}
+
+function buildThreadText(building, room, thread) {
+  const parts = [`栞 ─ ${building.name} / ${room.name}\n${thread.title}（${thread.frozenDate}）`];
+  thread.messages.forEach((m) => {
+    if (m.role === "user") {
+      parts.push(`【多恵子】\n${extractPlainText(m.content)}`);
+      return;
+    }
+    let body = extractPlainText(m.content);
+    const citations = Array.isArray(m.content)
+      ? m.content.filter((b) => b.type === "text").flatMap((b) => b.citations || [])
+      : [];
+    if (citations.length > 0) body += "\n" + citations.map((c) => `出典: ${c.url}`).join("\n");
+    parts.push(`【${room.name}】\n${body}`);
+  });
+  return parts.join("\n\n") + "\n";
+}
+
 function roomPreview(systemPrompt) {
   const firstLine = (systemPrompt || "").split("\n").find((l) => l.trim().length > 0) || "";
   return firstLine.length > 20 ? firstLine.slice(0, 20) + "…" : firstLine;
@@ -330,11 +391,8 @@ function buildApiError(status, json, model) {
 }
 
 // Anthropic Messages APIをブラウザから直接呼ぶ唯一の窓口
-async function anthropicMessages({ apiKey, model, system, messages, tools }) {
-  const body = { model, max_tokens: MAX_TOKENS, messages };
-  if (system) body.system = system;
-  if (tools) body.tools = tools;
-
+// body は buildRequestBody で組み立てたものをそのまま送る
+async function anthropicMessages({ apiKey, body }) {
   let res;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -353,7 +411,7 @@ async function anthropicMessages({ apiKey, model, system, messages, tools }) {
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw buildApiError(res.status, json, model);
+    throw buildApiError(res.status, json, body.model);
   }
   if (json.usage) {
     console.log("[書斎] usage", json.usage);
@@ -363,12 +421,53 @@ async function anthropicMessages({ apiKey, model, system, messages, tools }) {
 
 // 棟のプロバイダを見て呼び先を切り替える。現時点ではanthropicのみ実装。
 // 将来 provider: "gemini" 等を追加する際はここに分岐を足すだけでよい。
-async function callModel({ building, apiKey, system, messages, tools }) {
+async function callModel({ building, apiKey, body }) {
   switch (building.provider) {
     case "anthropic":
     default:
-      return anthropicMessages({ apiKey, model: building.model, system, messages, tools });
+      return anthropicMessages({ apiKey, body });
   }
+}
+
+// 通常送信と「記憶を綴じる」で共用するリクエストボディ。
+// tools・system・履歴をここ一か所で組み立てることで、両者のキャッシュのプレフィックスを一致させる。
+// 綴じる用に別実装を書かないこと。
+// options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
+function buildRequestBody({ building, room, memories, frozenDate }, messagesToSend, options = {}) {
+  // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
+  const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
+  const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
+  const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
+  const block2 = { type: "text", text: buildBlock2(room, memories, frozenDate), cache_control: cc };
+  const tools = room.webSearch
+    ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
+    : undefined;
+  const payloadMessages = messagesToSend.map((m, i) => {
+    if (i !== messagesToSend.length - 1) {
+      return { role: m.role, content: m.content };
+    }
+    // 履歴の最後のメッセージにキャッシュ境界を置く。保存形式は変えない。
+    if (typeof m.content === "string") {
+      return { role: m.role, content: [{ type: "text", text: m.content, cache_control: cc }] };
+    }
+    // 配列の場合（assistant発言など）は最後のtextブロックに付与
+    const content = m.content.map((b) => ({ ...b }));
+    for (let j = content.length - 1; j >= 0; j--) {
+      if (content[j].type === "text") { content[j].cache_control = cc; break; }
+    }
+    return { role: m.role, content };
+  });
+  if (options.extraMessages) payloadMessages.push(...options.extraMessages);
+
+  const body = {
+    model: building.model,
+    max_tokens: options.maxTokens || MAX_TOKENS,
+    messages: payloadMessages,
+    system: [block1, block2],
+  };
+  if (tools) body.tools = tools;
+  if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
+  return body;
 }
 
 function buildBlock2(room, memories, frozenDate) {
@@ -409,7 +508,7 @@ if (localStorage.getItem(K.buildings) === null) {
 
 /* ===== 汎用UI部品 ===== */
 
-function ConfirmDialog({ title, message, danger, requireDouble, onConfirm, onCancel }) {
+function ConfirmDialog({ title, message, danger, requireDouble, confirmLabel = "削除する", onConfirm, onCancel }) {
   const [armed, setArmed] = useState(false);
   return (
     <div className="overlay" onClick={onCancel}>
@@ -419,9 +518,9 @@ function ConfirmDialog({ title, message, danger, requireDouble, onConfirm, onCan
         <div className="modal-actions">
           <button onClick={onCancel}>やめる</button>
           {requireDouble && !armed ? (
-            <button className="danger" onClick={() => setArmed(true)}>削除する</button>
+            <button className="danger" onClick={() => setArmed(true)}>{confirmLabel}</button>
           ) : (
-            <button className="danger" onClick={onConfirm}>{requireDouble ? "本当に削除する" : "削除する"}</button>
+            <button className="danger" onClick={onConfirm}>{requireDouble ? `本当に${confirmLabel}` : confirmLabel}</button>
           )}
         </div>
       </div>
@@ -819,55 +918,24 @@ function ConversationScreen({
   const [bundling, setBundling] = useState(false);
   const [error, setError] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [editingIndex, setEditingIndex] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [confirmResend, setConfirmResend] = useState(null); // { index, count }
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current && bottomRef.current.scrollIntoView({ block: "end" });
   }, [thread.messages.length, sending]);
 
-  async function handleSend() {
-    const text = draft.trim();
-    if (!text || sending) return;
+  // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
+  async function sendToModel(nextMessages) {
     setError(null);
-    setDraft("");
-
-    const userMessage = { role: "user", content: text, ts: nowISO() };
-    const nextMessages = [...thread.messages, userMessage];
     onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
 
     try {
-      // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・最終メッセージの計3つ）
-      const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
-      const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
-      const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
-      const block2 = { type: "text", text: buildBlock2(room, memories, thread.frozenDate), cache_control: cc };
-      const tools = room.webSearch
-        ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
-        : undefined;
-      const payloadMessages = nextMessages.map((m, i) => {
-        if (i !== nextMessages.length - 1) {
-          return { role: m.role, content: m.content };
-        }
-        // 最後のメッセージ（送信したばかりのユーザー発言）にキャッシュ境界を置く。保存形式は変えない。
-        if (typeof m.content === "string") {
-          return { role: m.role, content: [{ type: "text", text: m.content, cache_control: cc }] };
-        }
-        // 防御的処理：万一配列だった場合は最後のtextブロックに付与
-        const content = m.content.map((b) => ({ ...b }));
-        for (let j = content.length - 1; j >= 0; j--) {
-          if (content[j].type === "text") { content[j].cache_control = cc; break; }
-        }
-        return { role: m.role, content };
-      });
-
-      const json = await callModel({
-        building,
-        apiKey,
-        system: [block1, block2],
-        messages: payloadMessages,
-        tools,
-      });
+      const body = buildRequestBody({ building, room, memories, frozenDate: thread.frozenDate }, nextMessages);
+      const json = await callModel({ building, apiKey, body });
 
       const assistantMessage = { role: "assistant", content: json.content, ts: nowISO(), usage: json.usage };
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
@@ -875,6 +943,62 @@ function ConversationScreen({
       setError(e);
     } finally {
       setSending(false);
+    }
+  }
+
+  function handleSend() {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setDraft("");
+    const userMessage = { role: "user", content: text, ts: nowISO() };
+    sendToModel([...thread.messages, userMessage]);
+  }
+
+  function startEdit(index) {
+    if (sending || bundling || editingIndex !== null) return;
+    setEditingIndex(index);
+    setEditText(extractPlainText(thread.messages[index].content));
+  }
+
+  function cancelEdit() {
+    setEditingIndex(null);
+    setEditText("");
+  }
+
+  function handleResend() {
+    if (editingIndex === null || !editText.trim() || sending || bundling) return;
+    const count = thread.messages.length - editingIndex - 1;
+    if (count > 0) {
+      setConfirmResend({ index: editingIndex, count });
+    } else {
+      doResend(editingIndex);
+    }
+  }
+
+  // 編集対象の直前まで切り詰め、編集後の発言から作り直す
+  function doResend(index) {
+    const text = editText.trim();
+    setConfirmResend(null);
+    cancelEdit();
+    const userMessage = { role: "user", content: text, ts: nowISO() };
+    sendToModel([...thread.messages.slice(0, index), userMessage]);
+  }
+
+  function handleSaveLog(format) {
+    setMenuOpen(false);
+    const base = `shiori_${room.name}_${thread.frozenDate}`;
+    if (format === "json") {
+      const data = {
+        app: "shiori",
+        type: "thread",
+        exportedAt: nowISO(),
+        building: { name: building.name, model: building.model },
+        room: { name: room.name },
+        thread,
+      };
+      downloadFile(`${base}.json`, JSON.stringify(data, null, 2), "application/json");
+    } else {
+      downloadFile(`${base}.txt`, buildThreadText(building, room, thread), "text/plain;charset=utf-8");
     }
   }
 
@@ -910,6 +1034,8 @@ function ConversationScreen({
             >
               <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={handleBundleMemory} disabled={bundling}>記憶を綴じる</button></div>
               <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => { setMenuOpen(false); onOpenMemories(); }}>記録帳を見る</button></div>
+              <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => handleSaveLog("text")}>ログを保存（テキスト）</button></div>
+              <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => handleSaveLog("json")}>ログを保存（JSON）</button></div>
             </div>
           )}
         </div>
@@ -921,7 +1047,22 @@ function ConversationScreen({
         )}
         {thread.messages.map((m, i) => (
           <div className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}`} key={i}>
-            <MessageContent content={m.content} />
+            {m.role === "user" && editingIndex === i ? (
+              <div className="msg-edit">
+                <textarea value={editText} onChange={(e) => setEditText(e.target.value)} autoFocus />
+                <div className="composer-row">
+                  <button onClick={cancelEdit}>やめる</button>
+                  <button className="accent" onClick={handleResend} disabled={sending || bundling || !editText.trim()}>再送信</button>
+                </div>
+              </div>
+            ) : (
+              <MessageContent content={m.content} />
+            )}
+            {m.role === "user" && editingIndex !== i && (
+              <div className="msg-tools">
+                <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
+              </div>
+            )}
             {m.role === "assistant" && <UsageLine usage={m.usage} />}
           </div>
         ))}
@@ -945,6 +1086,17 @@ function ConversationScreen({
           <button className="accent" onClick={handleSend} disabled={sending || !draft.trim()}>送信</button>
         </div>
       </div>
+
+      {confirmResend && (
+        <ConfirmDialog
+          title="この発言から作り直す"
+          message={`ここから先の <strong>${confirmResend.count} 件</strong>が消えて、この発言から作り直しになる。よい？`}
+          danger
+          confirmLabel="作り直す"
+          onCancel={() => setConfirmResend(null)}
+          onConfirm={() => doResend(confirmResend.index)}
+        />
+      )}
     </div>
   );
 }
@@ -984,10 +1136,27 @@ function MemoriesScreen({ room, memories, onBack, onDeleteMemory }) {
 
 /* ===== 設定画面 ===== */
 
-function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll }) {
+function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup }) {
   const [editingKey, setEditingKey] = useState(false);
   const [keyValue, setKeyValue] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [pendingBackup, setPendingBackup] = useState(null);
+  const [importError, setImportError] = useState(null);
+  const fileInputRef = useRef(null);
+
+  async function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // 同じファイルを選び直せるように
+    if (!file) return;
+    setImportError(null);
+    try {
+      const data = JSON.parse(await file.text());
+      if (!isValidBackup(data)) throw new Error("invalid");
+      setPendingBackup(data);
+    } catch (err) {
+      setImportError({ message: "このファイルは栞のバックアップではないようだ。" });
+    }
+  }
 
   return (
     <div className="page">
@@ -1029,6 +1198,26 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
       </div>
 
       <div className="settings-block">
+        <h2>バックアップ</h2>
+        <div className="kv-row">
+          <span>棟・部屋・スレッド・記録を書き出す</span>
+          <button onClick={onExportBackup}>書き出す</button>
+        </div>
+        <div className="kv-row">
+          <span>バックアップから元に戻す</span>
+          <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>読み込む</button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: "none" }}
+          onChange={handleImportFile}
+        />
+        <ErrorBox error={importError} />
+      </div>
+
+      <div className="settings-block">
         <h2>データ全消去</h2>
         <div className="kv-row">
           <span>棟・部屋・スレッド・記録をすべて消す</span>
@@ -1043,6 +1232,18 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
           requireDouble
           onCancel={() => setConfirmWipe(false)}
           onConfirm={() => { onWipeAll(); setConfirmWipe(false); }}
+        />
+      )}
+
+      {pendingBackup && (
+        <ConfirmDialog
+          title="バックアップを読み込む"
+          message="今あるデータは<strong>すべて</strong>、このバックアップの内容に置き換わる。よい？"
+          danger
+          requireDouble
+          confirmLabel="置き換える"
+          onCancel={() => setPendingBackup(null)}
+          onConfirm={() => onRestoreBackup(pendingBackup)}
         />
       )}
     </div>
@@ -1151,6 +1352,20 @@ function App() {
           Object.values(K).forEach((k) => localStorage.removeItem(k));
           window.location.reload();
         }}
+        onExportBackup={() => {
+          // APIキー・テーマ・lastThreadId は含めない
+          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories };
+          downloadFile(`shiori_backup_${todayYMD()}.json`, JSON.stringify(data, null, 2), "application/json");
+        }}
+        onRestoreBackup={(data) => {
+          // 全置き換え。APIキーとテーマには触らない
+          saveJSON(K.buildings, data.buildings);
+          saveJSON(K.rooms, data.rooms);
+          saveJSON(K.threads, data.threads);
+          saveJSON(K.memories, data.memories);
+          localStorage.removeItem(K.lastThreadId);
+          window.location.reload();
+        }}
       />
     );
   }
@@ -1180,16 +1395,20 @@ function App() {
         }}
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
         onOpenBundleMemory={async () => {
-          const transcript = thread.messages
-            .map((m) => `${m.role === "user" ? "多恵子" : "あなた"}: ${extractPlainText(m.content)}`)
-            .join("\n\n");
-          const prompt = `${transcript}\n\n---\n\n以上はあなたと多恵子さんの会話記録です。あなた自身の一人称で、事実と決定事項を中心に400字以内で記録を書いてください。感傷的な脚色はしないこと`;
-          const json = await anthropicMessages({
-            apiKey,
-            model: HAIKU_MODEL,
-            system: room.systemPrompt ? [{ type: "text", text: room.systemPrompt }] : undefined,
-            messages: [{ role: "user", content: prompt }],
-          });
+          // 棟のモデル本人が、会話の続きとして自分で綴じる。
+          // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
+          // 綴じ指示と応答は thread.messages に保存しない。
+          const body = buildRequestBody(
+            { building, room, memories, frozenDate: thread.frozenDate },
+            thread.messages,
+            {
+              maxTokens: BUNDLE_MAX_TOKENS,
+              toolChoice: { type: "none" }, // tools は外さず、検索の実行だけを封じる
+              extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
+            },
+          );
+          const json = await callModel({ building, apiKey, body });
+          console.log("[書斎] bundle usage", json.usage);
           const text = extractPlainText(json.content).trim();
           if (text) {
             const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
