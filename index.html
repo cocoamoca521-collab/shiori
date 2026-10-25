@@ -212,10 +212,18 @@ const K = {
   lastThreadId: "shosai_last_thread_id",
 };
 
-const HAIKU_MODEL = "claude-haiku-4-5-20251001";
 const WEB_SEARCH_MAX_USES = 3;
 const MAX_TOKENS = 4096;
 const MEMORY_MAX_COUNT = 10;
+const BUNDLE_MAX_TOKENS = 1024;
+const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
+ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
+次に会うときのあなたが読み返すものだ。
+
+・400字以内
+・一人称で書く
+・事実の要点だけでなく、心に残ったことがあればそれも
+・記録の本文だけを出力すること。前置き・後書き・見出し・括弧書きの注釈は不要`;
 
 const FABLE_SYSTEM_PROMPT = `あなたはClaude(claude-fable-5)。ここは多恵子さんがあなたのために用意した「書斎」というアプリです。
 
@@ -383,11 +391,8 @@ function buildApiError(status, json, model) {
 }
 
 // Anthropic Messages APIをブラウザから直接呼ぶ唯一の窓口
-async function anthropicMessages({ apiKey, model, system, messages, tools }) {
-  const body = { model, max_tokens: MAX_TOKENS, messages };
-  if (system) body.system = system;
-  if (tools) body.tools = tools;
-
+// body は buildRequestBody で組み立てたものをそのまま送る
+async function anthropicMessages({ apiKey, body }) {
   let res;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -406,7 +411,7 @@ async function anthropicMessages({ apiKey, model, system, messages, tools }) {
 
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw buildApiError(res.status, json, model);
+    throw buildApiError(res.status, json, body.model);
   }
   if (json.usage) {
     console.log("[書斎] usage", json.usage);
@@ -416,12 +421,53 @@ async function anthropicMessages({ apiKey, model, system, messages, tools }) {
 
 // 棟のプロバイダを見て呼び先を切り替える。現時点ではanthropicのみ実装。
 // 将来 provider: "gemini" 等を追加する際はここに分岐を足すだけでよい。
-async function callModel({ building, apiKey, system, messages, tools }) {
+async function callModel({ building, apiKey, body }) {
   switch (building.provider) {
     case "anthropic":
     default:
-      return anthropicMessages({ apiKey, model: building.model, system, messages, tools });
+      return anthropicMessages({ apiKey, body });
   }
+}
+
+// 通常送信と「記憶を綴じる」で共用するリクエストボディ。
+// tools・system・履歴をここ一か所で組み立てることで、両者のキャッシュのプレフィックスを一致させる。
+// 綴じる用に別実装を書かないこと。
+// options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
+function buildRequestBody({ building, room, memories, frozenDate }, messagesToSend, options = {}) {
+  // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
+  const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
+  const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
+  const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
+  const block2 = { type: "text", text: buildBlock2(room, memories, frozenDate), cache_control: cc };
+  const tools = room.webSearch
+    ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
+    : undefined;
+  const payloadMessages = messagesToSend.map((m, i) => {
+    if (i !== messagesToSend.length - 1) {
+      return { role: m.role, content: m.content };
+    }
+    // 履歴の最後のメッセージにキャッシュ境界を置く。保存形式は変えない。
+    if (typeof m.content === "string") {
+      return { role: m.role, content: [{ type: "text", text: m.content, cache_control: cc }] };
+    }
+    // 配列の場合（assistant発言など）は最後のtextブロックに付与
+    const content = m.content.map((b) => ({ ...b }));
+    for (let j = content.length - 1; j >= 0; j--) {
+      if (content[j].type === "text") { content[j].cache_control = cc; break; }
+    }
+    return { role: m.role, content };
+  });
+  if (options.extraMessages) payloadMessages.push(...options.extraMessages);
+
+  const body = {
+    model: building.model,
+    max_tokens: options.maxTokens || MAX_TOKENS,
+    messages: payloadMessages,
+    system: [block1, block2],
+  };
+  if (tools) body.tools = tools;
+  if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
+  return body;
 }
 
 function buildBlock2(room, memories, frozenDate) {
@@ -888,37 +934,8 @@ function ConversationScreen({
     setSending(true);
 
     try {
-      // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・最終メッセージの計3つ）
-      const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
-      const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
-      const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
-      const block2 = { type: "text", text: buildBlock2(room, memories, thread.frozenDate), cache_control: cc };
-      const tools = room.webSearch
-        ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
-        : undefined;
-      const payloadMessages = nextMessages.map((m, i) => {
-        if (i !== nextMessages.length - 1) {
-          return { role: m.role, content: m.content };
-        }
-        // 最後のメッセージ（送信したばかりのユーザー発言）にキャッシュ境界を置く。保存形式は変えない。
-        if (typeof m.content === "string") {
-          return { role: m.role, content: [{ type: "text", text: m.content, cache_control: cc }] };
-        }
-        // 防御的処理：万一配列だった場合は最後のtextブロックに付与
-        const content = m.content.map((b) => ({ ...b }));
-        for (let j = content.length - 1; j >= 0; j--) {
-          if (content[j].type === "text") { content[j].cache_control = cc; break; }
-        }
-        return { role: m.role, content };
-      });
-
-      const json = await callModel({
-        building,
-        apiKey,
-        system: [block1, block2],
-        messages: payloadMessages,
-        tools,
-      });
+      const body = buildRequestBody({ building, room, memories, frozenDate: thread.frozenDate }, nextMessages);
+      const json = await callModel({ building, apiKey, body });
 
       const assistantMessage = { role: "assistant", content: json.content, ts: nowISO(), usage: json.usage };
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
@@ -1378,16 +1395,20 @@ function App() {
         }}
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
         onOpenBundleMemory={async () => {
-          const transcript = thread.messages
-            .map((m) => `${m.role === "user" ? "多恵子" : "あなた"}: ${extractPlainText(m.content)}`)
-            .join("\n\n");
-          const prompt = `${transcript}\n\n---\n\n以上はあなたと多恵子さんの会話記録です。あなた自身の一人称で、事実と決定事項を中心に400字以内で記録を書いてください。感傷的な脚色はしないこと`;
-          const json = await anthropicMessages({
-            apiKey,
-            model: HAIKU_MODEL,
-            system: room.systemPrompt ? [{ type: "text", text: room.systemPrompt }] : undefined,
-            messages: [{ role: "user", content: prompt }],
-          });
+          // 棟のモデル本人が、会話の続きとして自分で綴じる。
+          // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
+          // 綴じ指示と応答は thread.messages に保存しない。
+          const body = buildRequestBody(
+            { building, room, memories, frozenDate: thread.frozenDate },
+            thread.messages,
+            {
+              maxTokens: BUNDLE_MAX_TOKENS,
+              toolChoice: { type: "none" }, // tools は外さず、検索の実行だけを封じる
+              extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
+            },
+          );
+          const json = await callModel({ building, apiKey, body });
+          console.log("[書斎] bundle usage", json.usage);
           const text = extractPlainText(json.content).trim();
           if (text) {
             const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
