@@ -216,6 +216,7 @@ const WEB_SEARCH_MAX_USES = 3;
 const MAX_TOKENS = 4096;
 const MEMORY_MAX_COUNT = 10;
 const BUNDLE_MAX_TOKENS = 1024;
+const PAUSE_TURN_MAX_ROUNDS = 3; // pause_turn を継続する周回の上限（最初の1回を含む）
 const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
 次に会うときのあなたが読み返すものだ。
@@ -311,6 +312,11 @@ function extractPlainText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+// 空白以外のテキストを持つ text ブロックが1つでもあるか。無ければ「空応答」として扱う。
+function hasVisibleText(content) {
+  return extractPlainText(content).trim() !== "";
 }
 
 // ファイル名に使えない文字（/ \ : * ? " < > | と改行）を _ に置き換える
@@ -429,6 +435,25 @@ async function callModel({ building, apiKey, body }) {
   }
 }
 
+// pause_turn（検索の途中で一時返却）なら、返ってきた content を assistant として足して同じボディで再送する。
+// 全周回の content を順に連結して返す。usage・stop_reason は最終周のもの。
+async function callModelWithContinuation({ building, apiKey, body }) {
+  const content = [];
+  let json;
+  for (let round = 1; round <= PAUSE_TURN_MAX_ROUNDS; round++) {
+    json = await callModel({ building, apiKey, body });
+    console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
+    content.push(...(json.content || []));
+    if (json.stop_reason !== "pause_turn") break;
+    if (round === PAUSE_TURN_MAX_ROUNDS) {
+      console.warn("[書斎] pause_turn が上限に達したため打ち切り");
+      break;
+    }
+    body = { ...body, messages: [...body.messages, { role: "assistant", content: json.content }] };
+  }
+  return { content, usage: json.usage, stop_reason: json.stop_reason };
+}
+
 // 通常送信と「記憶を綴じる」で共用するリクエストボディ。
 // tools・system・履歴をここ一か所で組み立てることで、両者のキャッシュのプレフィックスを一致させる。
 // 綴じる用に別実装を書かないこと。
@@ -442,8 +467,10 @@ function buildRequestBody({ building, room, memories, frozenDate }, messagesToSe
   const tools = room.webSearch
     ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
     : undefined;
-  const payloadMessages = messagesToSend.map((m, i) => {
-    if (i !== messagesToSend.length - 1) {
+  // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
+  const sendable = messagesToSend.filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
+  const payloadMessages = sendable.map((m, i) => {
+    if (i !== sendable.length - 1) {
       return { role: m.role, content: m.content };
     }
     // 履歴の最後のメッセージにキャッシュ境界を置く。保存形式は変えない。
@@ -898,7 +925,8 @@ function MessageContent({ content }) {
 }
 
 // モデル発言の下に出すキャッシュ状況の一行。usageの無い過去メッセージには何も出さない。
-function UsageLine({ usage }) {
+// stopReason が end_turn 以外のときだけ、行頭にその値を添える。
+function UsageLine({ usage, stopReason }) {
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
   const read = usage.cache_read_input_tokens || 0;
@@ -906,7 +934,8 @@ function UsageLine({ usage }) {
   const text = read > 0 || created > 0
     ? `栞 ─ 読 ${fmt(read)} ・ 書 ${fmt(created)} ・ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`
     : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
-  return <div className="usage-line">{text}</div>;
+  const prefix = stopReason && stopReason !== "end_turn" ? `${stopReason} ─ ` : "";
+  return <div className="usage-line">{prefix}{text}</div>;
 }
 
 function ConversationScreen({
@@ -935,9 +964,20 @@ function ConversationScreen({
 
     try {
       const body = buildRequestBody({ building, room, memories, frozenDate: thread.frozenDate }, nextMessages);
-      const json = await callModel({ building, apiKey, body });
+      const json = await callModelWithContinuation({ building, apiKey, body });
 
-      const assistantMessage = { role: "assistant", content: json.content, ts: nowISO(), usage: json.usage };
+      // 空応答は保存しない。送ったユーザー発言は残すので、編集＆再送信でやり直せる。
+      if (!hasVisibleText(json.content)) {
+        console.warn("[書斎] 空応答 stop_reason", json.stop_reason, json.usage);
+        const message = json.stop_reason === "refusal"
+          ? "この話題には筆を執れなかったようだ。言い回しを変えて、もう一度試してみてほしい。"
+          : `返事が綴られなかった（${json.stop_reason}）。もう一度送ってみてほしい。`;
+        throw new ShosaiError(message, { raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2) });
+      }
+
+      const assistantMessage = {
+        role: "assistant", content: json.content, ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
+      };
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
     } catch (e) {
       setError(e);
@@ -1063,7 +1103,7 @@ function ConversationScreen({
                 <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
               </div>
             )}
-            {m.role === "assistant" && <UsageLine usage={m.usage} />}
+            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} />}
           </div>
         ))}
         {sending && (
@@ -1407,13 +1447,17 @@ function App() {
               extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
             },
           );
-          const json = await callModel({ building, apiKey, body });
+          const json = await callModelWithContinuation({ building, apiKey, body });
           console.log("[書斎] bundle usage", json.usage);
           const text = extractPlainText(json.content).trim();
-          if (text) {
-            const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
-            setMemories([...memories, memory]);
+          if (!text) {
+            console.warn("[書斎] 綴じ空応答 stop_reason", json.stop_reason, json.usage);
+            throw new ShosaiError("記録が綴られなかった。もう一度試してみてほしい。", {
+              raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2),
+            });
           }
+          const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
+          setMemories([...memories, memory]);
         }}
       />
     );
