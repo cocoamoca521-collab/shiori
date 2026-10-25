@@ -140,6 +140,12 @@
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent); }
   .usage-line { color: var(--rule); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .msg-tools { margin-top: 4px; }
+  .msg-tools button { border: none; font-size: 12px; color: var(--rule); padding: 4px 6px; }
+  .msg-tools button:hover, .msg-tools button:active { color: var(--accent); }
+  .msg-edit { display: flex; flex-direction: column; gap: 10px; text-align: left; }
+  .msg-edit textarea { min-height: 72px; resize: vertical; }
+  .msg-edit .composer-row { justify-content: flex-end; gap: 10px; }
 
   .composer { border-top: 1px solid var(--rule); padding-top: 16px; margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
   .composer textarea { min-height: 72px; resize: vertical; }
@@ -299,6 +305,53 @@ function extractPlainText(content) {
   return content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
 
+// ファイル名に使えない文字（/ \ : * ? " < > | と改行）を _ に置き換える
+function sanitizeFilename(name) {
+  return String(name).replace(/[\/\\:*?"<>|\r\n]/g, "_");
+}
+
+// Blob と一時的な <a download> でファイルを保存させる
+function downloadFile(filename, text, mimeType) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = sanitizeFilename(filename);
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function todayYMD() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function isValidBackup(data) {
+  return !!data && data.app === "shiori"
+    && Array.isArray(data.buildings) && Array.isArray(data.rooms)
+    && Array.isArray(data.threads) && Array.isArray(data.memories);
+}
+
+function buildThreadText(building, room, thread) {
+  const parts = [`栞 ─ ${building.name} / ${room.name}\n${thread.title}（${thread.frozenDate}）`];
+  thread.messages.forEach((m) => {
+    if (m.role === "user") {
+      parts.push(`【多恵子】\n${extractPlainText(m.content)}`);
+      return;
+    }
+    let body = extractPlainText(m.content);
+    const citations = Array.isArray(m.content)
+      ? m.content.filter((b) => b.type === "text").flatMap((b) => b.citations || [])
+      : [];
+    if (citations.length > 0) body += "\n" + citations.map((c) => `出典: ${c.url}`).join("\n");
+    parts.push(`【${room.name}】\n${body}`);
+  });
+  return parts.join("\n\n") + "\n";
+}
+
 function roomPreview(systemPrompt) {
   const firstLine = (systemPrompt || "").split("\n").find((l) => l.trim().length > 0) || "";
   return firstLine.length > 20 ? firstLine.slice(0, 20) + "…" : firstLine;
@@ -409,7 +462,7 @@ if (localStorage.getItem(K.buildings) === null) {
 
 /* ===== 汎用UI部品 ===== */
 
-function ConfirmDialog({ title, message, danger, requireDouble, onConfirm, onCancel }) {
+function ConfirmDialog({ title, message, danger, requireDouble, confirmLabel = "削除する", onConfirm, onCancel }) {
   const [armed, setArmed] = useState(false);
   return (
     <div className="overlay" onClick={onCancel}>
@@ -419,9 +472,9 @@ function ConfirmDialog({ title, message, danger, requireDouble, onConfirm, onCan
         <div className="modal-actions">
           <button onClick={onCancel}>やめる</button>
           {requireDouble && !armed ? (
-            <button className="danger" onClick={() => setArmed(true)}>削除する</button>
+            <button className="danger" onClick={() => setArmed(true)}>{confirmLabel}</button>
           ) : (
-            <button className="danger" onClick={onConfirm}>{requireDouble ? "本当に削除する" : "削除する"}</button>
+            <button className="danger" onClick={onConfirm}>{requireDouble ? `本当に${confirmLabel}` : confirmLabel}</button>
           )}
         </div>
       </div>
@@ -819,20 +872,18 @@ function ConversationScreen({
   const [bundling, setBundling] = useState(false);
   const [error, setError] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [editingIndex, setEditingIndex] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [confirmResend, setConfirmResend] = useState(null); // { index, count }
   const bottomRef = useRef(null);
 
   useEffect(() => {
     bottomRef.current && bottomRef.current.scrollIntoView({ block: "end" });
   }, [thread.messages.length, sending]);
 
-  async function handleSend() {
-    const text = draft.trim();
-    if (!text || sending) return;
+  // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
+  async function sendToModel(nextMessages) {
     setError(null);
-    setDraft("");
-
-    const userMessage = { role: "user", content: text, ts: nowISO() };
-    const nextMessages = [...thread.messages, userMessage];
     onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
 
@@ -878,6 +929,62 @@ function ConversationScreen({
     }
   }
 
+  function handleSend() {
+    const text = draft.trim();
+    if (!text || sending) return;
+    setDraft("");
+    const userMessage = { role: "user", content: text, ts: nowISO() };
+    sendToModel([...thread.messages, userMessage]);
+  }
+
+  function startEdit(index) {
+    if (sending || bundling || editingIndex !== null) return;
+    setEditingIndex(index);
+    setEditText(extractPlainText(thread.messages[index].content));
+  }
+
+  function cancelEdit() {
+    setEditingIndex(null);
+    setEditText("");
+  }
+
+  function handleResend() {
+    if (editingIndex === null || !editText.trim() || sending || bundling) return;
+    const count = thread.messages.length - editingIndex - 1;
+    if (count > 0) {
+      setConfirmResend({ index: editingIndex, count });
+    } else {
+      doResend(editingIndex);
+    }
+  }
+
+  // 編集対象の直前まで切り詰め、編集後の発言から作り直す
+  function doResend(index) {
+    const text = editText.trim();
+    setConfirmResend(null);
+    cancelEdit();
+    const userMessage = { role: "user", content: text, ts: nowISO() };
+    sendToModel([...thread.messages.slice(0, index), userMessage]);
+  }
+
+  function handleSaveLog(format) {
+    setMenuOpen(false);
+    const base = `shiori_${room.name}_${thread.frozenDate}`;
+    if (format === "json") {
+      const data = {
+        app: "shiori",
+        type: "thread",
+        exportedAt: nowISO(),
+        building: { name: building.name, model: building.model },
+        room: { name: room.name },
+        thread,
+      };
+      downloadFile(`${base}.json`, JSON.stringify(data, null, 2), "application/json");
+    } else {
+      downloadFile(`${base}.txt`, buildThreadText(building, room, thread), "text/plain;charset=utf-8");
+    }
+  }
+
   async function handleBundleMemory() {
     setMenuOpen(false);
     setBundling(true);
@@ -910,6 +1017,8 @@ function ConversationScreen({
             >
               <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={handleBundleMemory} disabled={bundling}>記憶を綴じる</button></div>
               <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => { setMenuOpen(false); onOpenMemories(); }}>記録帳を見る</button></div>
+              <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => handleSaveLog("text")}>ログを保存（テキスト）</button></div>
+              <div><button style={{ border: "none", width: "100%", textAlign: "left" }} onClick={() => handleSaveLog("json")}>ログを保存（JSON）</button></div>
             </div>
           )}
         </div>
@@ -921,7 +1030,22 @@ function ConversationScreen({
         )}
         {thread.messages.map((m, i) => (
           <div className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}`} key={i}>
-            <MessageContent content={m.content} />
+            {m.role === "user" && editingIndex === i ? (
+              <div className="msg-edit">
+                <textarea value={editText} onChange={(e) => setEditText(e.target.value)} autoFocus />
+                <div className="composer-row">
+                  <button onClick={cancelEdit}>やめる</button>
+                  <button className="accent" onClick={handleResend} disabled={sending || bundling || !editText.trim()}>再送信</button>
+                </div>
+              </div>
+            ) : (
+              <MessageContent content={m.content} />
+            )}
+            {m.role === "user" && editingIndex !== i && (
+              <div className="msg-tools">
+                <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
+              </div>
+            )}
             {m.role === "assistant" && <UsageLine usage={m.usage} />}
           </div>
         ))}
@@ -945,6 +1069,17 @@ function ConversationScreen({
           <button className="accent" onClick={handleSend} disabled={sending || !draft.trim()}>送信</button>
         </div>
       </div>
+
+      {confirmResend && (
+        <ConfirmDialog
+          title="この発言から作り直す"
+          message={`ここから先の <strong>${confirmResend.count} 件</strong>が消えて、この発言から作り直しになる。よい？`}
+          danger
+          confirmLabel="作り直す"
+          onCancel={() => setConfirmResend(null)}
+          onConfirm={() => doResend(confirmResend.index)}
+        />
+      )}
     </div>
   );
 }
@@ -984,10 +1119,27 @@ function MemoriesScreen({ room, memories, onBack, onDeleteMemory }) {
 
 /* ===== 設定画面 ===== */
 
-function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll }) {
+function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup }) {
   const [editingKey, setEditingKey] = useState(false);
   const [keyValue, setKeyValue] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [pendingBackup, setPendingBackup] = useState(null);
+  const [importError, setImportError] = useState(null);
+  const fileInputRef = useRef(null);
+
+  async function handleImportFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // 同じファイルを選び直せるように
+    if (!file) return;
+    setImportError(null);
+    try {
+      const data = JSON.parse(await file.text());
+      if (!isValidBackup(data)) throw new Error("invalid");
+      setPendingBackup(data);
+    } catch (err) {
+      setImportError({ message: "このファイルは栞のバックアップではないようだ。" });
+    }
+  }
 
   return (
     <div className="page">
@@ -1029,6 +1181,26 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
       </div>
 
       <div className="settings-block">
+        <h2>バックアップ</h2>
+        <div className="kv-row">
+          <span>棟・部屋・スレッド・記録を書き出す</span>
+          <button onClick={onExportBackup}>書き出す</button>
+        </div>
+        <div className="kv-row">
+          <span>バックアップから元に戻す</span>
+          <button onClick={() => fileInputRef.current && fileInputRef.current.click()}>読み込む</button>
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: "none" }}
+          onChange={handleImportFile}
+        />
+        <ErrorBox error={importError} />
+      </div>
+
+      <div className="settings-block">
         <h2>データ全消去</h2>
         <div className="kv-row">
           <span>棟・部屋・スレッド・記録をすべて消す</span>
@@ -1043,6 +1215,18 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
           requireDouble
           onCancel={() => setConfirmWipe(false)}
           onConfirm={() => { onWipeAll(); setConfirmWipe(false); }}
+        />
+      )}
+
+      {pendingBackup && (
+        <ConfirmDialog
+          title="バックアップを読み込む"
+          message="今あるデータは<strong>すべて</strong>、このバックアップの内容に置き換わる。よい？"
+          danger
+          requireDouble
+          confirmLabel="置き換える"
+          onCancel={() => setPendingBackup(null)}
+          onConfirm={() => onRestoreBackup(pendingBackup)}
         />
       )}
     </div>
@@ -1149,6 +1333,20 @@ function App() {
         onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         onWipeAll={() => {
           Object.values(K).forEach((k) => localStorage.removeItem(k));
+          window.location.reload();
+        }}
+        onExportBackup={() => {
+          // APIキー・テーマ・lastThreadId は含めない
+          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories };
+          downloadFile(`shiori_backup_${todayYMD()}.json`, JSON.stringify(data, null, 2), "application/json");
+        }}
+        onRestoreBackup={(data) => {
+          // 全置き換え。APIキーとテーマには触らない
+          saveJSON(K.buildings, data.buildings);
+          saveJSON(K.rooms, data.rooms);
+          saveJSON(K.threads, data.threads);
+          saveJSON(K.memories, data.memories);
+          localStorage.removeItem(K.lastThreadId);
           window.location.reload();
         }}
       />
