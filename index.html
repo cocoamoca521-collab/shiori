@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <title>栞</title>
 <meta name="description" content="サブスクリプションに依存せず、APIで各モデルと話し続けるための一人用チャットアプリ。">
 <link rel="manifest" href="manifest.json">
@@ -83,6 +83,13 @@
     border-bottom: 1px solid var(--rule);
     padding-bottom: 12px;
     margin-bottom: 24px;
+    /* 画面上部に固定。.page の上余白ぶんを内側に取り込み、見た目の位置は変えない */
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    background: var(--bg);
+    margin-top: -24px;
+    padding-top: 24px;
   }
   .topbar-title { font-size: 15px; }
   .topbar-title .crumb { cursor: pointer; }
@@ -148,6 +155,15 @@
   .msg-edit .composer-row { justify-content: flex-end; gap: 10px; }
 
   .composer { border-top: 1px solid var(--rule); padding-top: 16px; margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+  /* 会話画面の入力欄は画面下部に固定。.page の下余白の一部を内側に取り込み、最下部での見た目は変えない */
+  .composer {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    background: var(--bg);
+    margin-bottom: -24px;
+    padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+  }
   .composer textarea { min-height: 72px; resize: vertical; }
   .composer-row { display: flex; justify-content: space-between; align-items: center; }
 
@@ -953,7 +969,11 @@ function ConversationScreen({
   const bottomRef = useRef(null);
 
   useEffect(() => {
-    bottomRef.current && bottomRef.current.scrollIntoView({ block: "end" });
+    // 入力欄が画面下部に固定されているため、末尾要素ではなくページ最下部までスクロールして
+    // 最新メッセージが入力欄の裏に隠れないようにする。
+    if (bottomRef.current) {
+      window.scrollTo({ top: document.documentElement.scrollHeight });
+    }
   }, [thread.messages.length, sending]);
 
   // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
