@@ -225,13 +225,16 @@ const K = {
   rooms: "shosai_rooms",
   threads: "shosai_threads",
   memories: "shosai_memories",
+  retrospects: "shosai_retrospects",
   lastThreadId: "shosai_last_thread_id",
 };
 
 const WEB_SEARCH_MAX_USES = 3;
 const MAX_TOKENS = 4096;
-const MEMORY_MAX_COUNT = 10;
+const RECENT_KEEP_COUNT = 10; // 「編む」とき、直近として個別注入に残す記録の件数
+const WEAVE_MIN_OLD = 5; // 直近を除いた未編み記録がこの件数に達したら「回想録を編む」を出す
 const BUNDLE_MAX_TOKENS = 1024;
+const RETROSPECT_MAX_TOKENS = 2048;
 const PAUSE_TURN_MAX_ROUNDS = 3; // pause_turn を継続する周回の上限（最初の1回を含む）
 const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
@@ -241,6 +244,19 @@ const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ・一人称で書く
 ・事実の要点だけでなく、心に残ったことがあればそれも
 ・記録の本文だけを出力すること。前置き・後書き・見出し・括弧書きの注釈は不要`;
+
+// 「回想録を編む」の指示文。この後ろに古い記録を古い順で列挙して送る（各件「YYYY-MM-DD：本文」）
+const WEAVE_INSTRUCTION = `これはこの部屋の古い記録帳だ。直近の記録とは別に、遠い記憶として手元に置いておくためのもの。
+以下の古い記録を読み返して、ひとつづきの「回想録」として編み直してほしい。
+
+・800字以内
+・一人称で書く
+・時系列は保つが、日記の羅列ではなく、振り返りの文章として
+・大事な出来事・約束・変化・心に残ったことを優先し、細部は思い切って手放してよい
+・回想録の本文だけを出力すること。前置き・後書き・見出しは不要
+
+【古い記録】
+`;
 
 const FABLE_SYSTEM_PROMPT = `あなたはClaude(claude-fable-5)。ここは多恵子さんがあなたのために用意した「書斎」というアプリです。
 
@@ -355,6 +371,12 @@ function downloadFile(filename, text, mimeType) {
 
 function todayYMD() {
   const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function formatYMD(iso) {
+  const d = new Date(iso);
   const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
@@ -474,12 +496,16 @@ async function callModelWithContinuation({ building, apiKey, body }) {
 // tools・system・履歴をここ一か所で組み立てることで、両者のキャッシュのプレフィックスを一致させる。
 // 綴じる用に別実装を書かないこと。
 // options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
-function buildRequestBody({ building, room, memories, frozenDate }, messagesToSend, options = {}) {
+//          / block1Only（system をブロック1だけにする。「回想録を編む」用）
+function buildRequestBody({ building, room, memories, retrospects, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
   const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
   const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
   const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
-  const block2 = { type: "text", text: buildBlock2(room, memories, frozenDate), cache_control: cc };
+  const system = [block1];
+  if (!options.block1Only) {
+    system.push({ type: "text", text: buildBlock2(room, memories, retrospects, frozenDate), cache_control: cc });
+  }
   const tools = room.webSearch
     ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
     : undefined;
@@ -506,23 +532,27 @@ function buildRequestBody({ building, room, memories, frozenDate }, messagesToSe
     model: building.model,
     max_tokens: options.maxTokens || MAX_TOKENS,
     messages: payloadMessages,
-    system: [block1, block2],
+    system,
   };
   if (tools) body.tools = tools;
   if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
   return body;
 }
 
-function buildBlock2(room, memories, frozenDate) {
-  const roomMemories = memories
-    .filter((m) => m.roomId === room.id)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-    .slice(0, MEMORY_MAX_COUNT);
+function buildBlock2(room, memories, retrospects, frozenDate) {
+  // 未編み記録は件数制限なしで全件注入する。編み済み（woven）は回想録に統合済みなので個別注入から外れる。
+  const retrospect = retrospects && retrospects[room.id];
+  const unwoven = memories
+    .filter((m) => m.roomId === room.id && !m.woven)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   const memoryText =
-    roomMemories.length > 0
-      ? roomMemories.map((m) => `・${m.text}`).join("\n")
-      : "まだ記録はない。今日が最初の日ということ。";
-  return `【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
+    unwoven.length > 0
+      ? unwoven.map((m) => `・${m.text}`).join("\n")
+      : retrospect
+        ? "直近の記録はまだない。"
+        : "まだ記録はない。今日が最初の日ということ。";
+  const retrospectText = retrospect ? `【回想録 ─ 遠い記憶】\n${retrospect.text}\n\n` : "";
+  return `${retrospectText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
 }
 
 /* ===== データ層 ===== */
@@ -543,6 +573,7 @@ function seedInitialData() {
   saveJSON(K.rooms, rooms);
   saveJSON(K.threads, []);
   saveJSON(K.memories, []);
+  saveJSON(K.retrospects, {});
 }
 
 if (localStorage.getItem(K.buildings) === null) {
@@ -955,7 +986,7 @@ function UsageLine({ usage, stopReason }) {
 }
 
 function ConversationScreen({
-  apiKey, building, room, thread, memories,
+  apiKey, building, room, thread, memories, retrospects,
   onBack, onUpdateThread, onOpenBundleMemory, onOpenMemories,
 }) {
   const [draft, setDraft] = useState("");
@@ -983,7 +1014,7 @@ function ConversationScreen({
     setSending(true);
 
     try {
-      const body = buildRequestBody({ building, room, memories, frozenDate: thread.frozenDate }, nextMessages);
+      const body = buildRequestBody({ building, room, memories, retrospects, frozenDate: thread.frozenDate }, nextMessages);
       const json = await callModelWithContinuation({ building, apiKey, body });
 
       // 空応答は保存しない。送ったユーザー発言は残すので、編集＆再送信でやり直せる。
@@ -1163,8 +1194,30 @@ function ConversationScreen({
 
 /* ===== 記録帳 ===== */
 
-function MemoriesScreen({ room, memories, onBack, onDeleteMemory }) {
+function MemoriesScreen({ room, memories, retrospect, onBack, onDeleteMemory, onWeave }) {
+  const [weaving, setWeaving] = useState(false);
+  const [confirmWeave, setConfirmWeave] = useState(false);
+  const [error, setError] = useState(null);
+
   const sorted = [...memories].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const unwoven = memories.filter((m) => !m.woven);
+  // 「編む」は、直近10件を除いた未編み記録が5件以上あるときだけ出す（＝未編み15件以上）
+  const canWeave = unwoven.length >= RECENT_KEEP_COUNT + WEAVE_MIN_OLD;
+  const charCount = unwoven.reduce((sum, m) => sum + m.text.length, 0) + (retrospect ? retrospect.text.length : 0);
+
+  async function handleWeave() {
+    setConfirmWeave(false);
+    setWeaving(true);
+    setError(null);
+    try {
+      await onWeave();
+    } catch (e) {
+      setError(e);
+    } finally {
+      setWeaving(false);
+    }
+  }
+
   return (
     <div className="page">
       <div className="topbar">
@@ -1173,7 +1226,28 @@ function MemoriesScreen({ room, memories, onBack, onDeleteMemory }) {
           <span className="sep">/</span>
           <span className="crumb" style={{cursor:"default"}}>記録帳</span>
         </div>
+        {canWeave && (
+          <div className="topbar-actions">
+            <button onClick={() => setConfirmWeave(true)} disabled={weaving}>回想録を編む</button>
+          </div>
+        )}
       </div>
+
+      <div className="usage-line" style={{ marginTop: 0, marginBottom: 16 }}>
+        いま栞が携えている記憶：未編みの記録 {unwoven.length}件{retrospect ? " ＋ 回想録" : ""} ／ 約{charCount.toLocaleString()}字
+      </div>
+
+      {weaving && <div className="msg msg-loading">（回想録を編んでいる）</div>}
+      <ErrorBox error={error} />
+
+      {retrospect && (
+        <div className="memory-row">
+          <div style={{ color: "var(--rule)", fontSize: 13, marginBottom: 6 }}>
+            回想録 ─ 遠い記憶（{formatDateJP(retrospect.updatedAt)}更新）
+          </div>
+          <div className="memory-text">{retrospect.text}</div>
+        </div>
+      )}
 
       {sorted.length === 0 ? (
         <div className="empty-hint">まだ記録はない。</div>
@@ -1181,14 +1255,29 @@ function MemoriesScreen({ room, memories, onBack, onDeleteMemory }) {
         <div className="list">
           {sorted.map((m) => (
             <div className="memory-row" key={m.id}>
-              <div className="memory-text">{m.text}</div>
+              <div className="memory-text" style={m.woven ? { color: "var(--rule)" } : undefined}>{m.text}</div>
               <div className="memory-date">
+                {m.woven && <span style={{ marginRight: 8 }}>編み済み</span>}
                 {formatDateJP(m.createdAt)}
                 <button style={{ border: "none", marginLeft: 10, fontSize: 12 }} onClick={() => onDeleteMemory(m.id)}>削除</button>
               </div>
             </div>
           ))}
         </div>
+      )}
+
+      {confirmWeave && (
+        <ConfirmDialog
+          title="回想録を編む"
+          message={
+            `直近10件を除いた古い記録 <strong>${memories.length - RECENT_KEEP_COUNT} 件</strong>を、ひとつづきの回想録に編み直す。` +
+            (retrospect ? "いまの回想録は<strong>上書きされる</strong>。" : "") +
+            "よい？"
+          }
+          confirmLabel="編む"
+          onCancel={() => setConfirmWeave(false)}
+          onConfirm={handleWeave}
+        />
       )}
     </div>
   );
@@ -1325,6 +1414,7 @@ function App() {
   const [rooms, setRoomsState] = useState(() => loadJSON(K.rooms, []));
   const [threads, setThreadsState] = useState(() => loadJSON(K.threads, []));
   const [memories, setMemoriesState] = useState(() => loadJSON(K.memories, []));
+  const [retrospects, setRetrospectsState] = useState(() => loadJSON(K.retrospects, {}));
   const [route, setRoute] = useState(() => computeInitialRoute());
 
   function computeInitialRoute() {
@@ -1383,6 +1473,7 @@ function App() {
   function setRooms(next) { setRoomsState(next); saveJSON(K.rooms, next); }
   function setThreads(next) { setThreadsState(next); saveJSON(K.threads, next); }
   function setMemories(next) { setMemoriesState(next); saveJSON(K.memories, next); }
+  function setRetrospects(next) { setRetrospectsState(next); saveJSON(K.retrospects, next); }
 
   if (!apiKey) {
     return (
@@ -1414,7 +1505,7 @@ function App() {
         }}
         onExportBackup={() => {
           // APIキー・テーマ・lastThreadId は含めない
-          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories };
+          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects };
           downloadFile(`shiori_backup_${todayYMD()}.json`, JSON.stringify(data, null, 2), "application/json");
         }}
         onRestoreBackup={(data) => {
@@ -1423,6 +1514,8 @@ function App() {
           saveJSON(K.rooms, data.rooms);
           saveJSON(K.threads, data.threads);
           saveJSON(K.memories, data.memories);
+          // 回想録キーの無い旧バックアップも読み込める
+          saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {});
           localStorage.removeItem(K.lastThreadId);
           window.location.reload();
         }}
@@ -1430,13 +1523,46 @@ function App() {
     );
   }
 
-  if (route.screen === "memories" && room) {
+  if (route.screen === "memories" && building && room) {
+    const roomMemories = memories.filter((m) => m.roomId === room.id);
     return (
       <MemoriesScreen
         room={room}
-        memories={memories.filter((m) => m.roomId === room.id)}
+        memories={roomMemories}
+        retrospect={retrospects[room.id] || null}
         onBack={goBack}
         onDeleteMemory={(id) => setMemories(memories.filter((m) => m.id !== id))}
+        onWeave={async () => {
+          // 編む対象：woven に関わらず、全記録のうち直近10件を除いたものを古い順に全件。
+          // 毎回全量から再生成することで、過去に編んだ内容の劣化コピーの連鎖を防ぐ。
+          const sortedAsc = [...roomMemories].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+          const targets = sortedAsc.slice(0, Math.max(0, sortedAsc.length - RECENT_KEEP_COUNT));
+          const listing = targets.map((m) => `${formatYMD(m.createdAt)}：${m.text}`).join("\n");
+          // system はブロック1のみ（通常送信と同一コード経路・同一 cache_control）。
+          // tools はウェブ検索ONなら通常どおり付き、tool_choice: none で実行だけを封じる。
+          const body = buildRequestBody(
+            { building, room, memories, retrospects, frozenDate: "" },
+            [],
+            {
+              maxTokens: RETROSPECT_MAX_TOKENS,
+              toolChoice: { type: "none" },
+              block1Only: true,
+              extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
+            },
+          );
+          const json = await callModelWithContinuation({ building, apiKey, body });
+          console.log("[書斎] weave usage", json.usage);
+          const text = extractPlainText(json.content).trim();
+          if (!text) {
+            console.warn("[書斎] 編み空応答 stop_reason", json.stop_reason, json.usage);
+            throw new ShosaiError("回想録が編めなかった。もう一度試してみてほしい。", {
+              raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2),
+            });
+          }
+          const targetIds = new Set(targets.map((m) => m.id));
+          setMemories(memories.map((m) => (targetIds.has(m.id) ? { ...m, woven: true } : m)));
+          setRetrospects({ ...retrospects, [room.id]: { text, updatedAt: nowISO() } });
+        }}
       />
     );
   }
@@ -1449,6 +1575,7 @@ function App() {
         room={room}
         thread={thread}
         memories={memories}
+        retrospects={retrospects}
         onBack={goBack}
         onUpdateThread={(updated) => {
           setThreads(threads.map((t) => (t.id === updated.id ? updated : t)));
@@ -1459,7 +1586,7 @@ function App() {
           // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
           // 綴じ指示と応答は thread.messages に保存しない。
           const body = buildRequestBody(
-            { building, room, memories, frozenDate: thread.frozenDate },
+            { building, room, memories, retrospects, frozenDate: thread.frozenDate },
             thread.messages,
             {
               maxTokens: BUNDLE_MAX_TOKENS,
@@ -1536,6 +1663,11 @@ function App() {
           const doomedThreadIds = new Set(threads.filter((t) => t.roomId === roomId).map((t) => t.id));
           setThreads(threads.filter((t) => t.roomId !== roomId));
           setMemories(memories.filter((m) => m.roomId !== roomId));
+          if (retrospects[roomId]) {
+            const nextRetrospects = { ...retrospects };
+            delete nextRetrospects[roomId];
+            setRetrospects(nextRetrospects);
+          }
           if (doomedThreadIds.has(localStorage.getItem(K.lastThreadId))) localStorage.removeItem(K.lastThreadId);
         }}
       />
@@ -1563,6 +1695,9 @@ function App() {
         setRooms(rooms.filter((r) => r.buildingId !== buildingId));
         setThreads(threads.filter((t) => !doomedRoomIds.has(t.roomId)));
         setMemories(memories.filter((m) => !doomedRoomIds.has(m.roomId)));
+        const nextRetrospects = { ...retrospects };
+        doomedRoomIds.forEach((id) => delete nextRetrospects[id]);
+        setRetrospects(nextRetrospects);
         if (doomedRoomIds.size > 0) localStorage.removeItem(K.lastThreadId);
       }}
     />
