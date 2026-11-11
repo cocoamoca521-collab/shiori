@@ -1301,10 +1301,30 @@ function ConversationScreen({
 
 /* ===== 記録帳 ===== */
 
-function MemoriesScreen({ room, memories, retrospect, notes, onBack, onDeleteMemory, onDeleteNote, onWeave }) {
+// 記録帳画面のインライン編集欄（会話画面の自分発言編集と同じ見た目）。空白のみでは確定できない。
+function InlineTextEditor({ value, onChange, confirmLabel, onCancel, onConfirm }) {
+  return (
+    <div className="msg-edit">
+      <textarea value={value} onChange={(e) => onChange(e.target.value)} autoFocus />
+      <div className="composer-row">
+        <button onClick={onCancel}>やめる</button>
+        <button className="accent" onClick={onConfirm} disabled={!value.trim()}>{confirmLabel}</button>
+      </div>
+    </div>
+  );
+}
+
+function MemoriesScreen({
+  room, memories, retrospect, notes, onBack,
+  onDeleteMemory, onDeleteNote, onSaveMemory, onSaveNote, onAddMemory, onAddNote, onWeave,
+}) {
   const [weaving, setWeaving] = useState(false);
   const [confirmWeave, setConfirmWeave] = useState(false);
   const [error, setError] = useState(null);
+  // 編集・追加は同時に1件まで。{ kind: "memory" | "note", id: 既存なら id、新規なら null }
+  const [editing, setEditing] = useState(null);
+  const [editText, setEditText] = useState("");
+  const busy = editing !== null || weaving;
 
   const sorted = [...memories].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const unwoven = memories.filter((m) => !m.woven);
@@ -1327,6 +1347,37 @@ function MemoriesScreen({ room, memories, retrospect, notes, onBack, onDeleteMem
     }
   }
 
+  function startEdit(kind, item) {
+    if (busy) return;
+    setEditing({ kind, id: item ? item.id : null });
+    setEditText(item ? item.text : "");
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setEditText("");
+  }
+
+  // 痕跡は残さない：text 以外（createdAt 等）は変えず、編集済みの印も付けない
+  function confirmEdit() {
+    const text = editText.trim();
+    if (!editing || !text) return;
+    const { kind, id } = editing;
+    if (kind === "memory") {
+      if (id) onSaveMemory(id, text); else onAddMemory(text);
+    } else {
+      if (id) onSaveNote(id, text); else onAddNote(text);
+    }
+    cancelEdit();
+  }
+
+  const isEditing = (kind, id) => editing && editing.kind === kind && editing.id === id;
+  const editor = (label) => (
+    <InlineTextEditor value={editText} onChange={setEditText} confirmLabel={label} onCancel={cancelEdit} onConfirm={confirmEdit} />
+  );
+  const smallBtn = { border: "none", marginLeft: 10, fontSize: 12 };
+  const sectionHead = { display: "flex", justifyContent: "space-between", alignItems: "baseline", color: "var(--rule)", fontSize: 13, marginTop: 20 };
+
   return (
     <div className="page">
       <div className="topbar">
@@ -1337,7 +1388,7 @@ function MemoriesScreen({ room, memories, retrospect, notes, onBack, onDeleteMem
         </div>
         {canWeave && (
           <div className="topbar-actions">
-            <button onClick={() => setConfirmWeave(true)} disabled={weaving}>回想録を編む</button>
+            <button onClick={() => setConfirmWeave(true)} disabled={busy}>回想録を編む</button>
           </div>
         )}
       </div>
@@ -1349,6 +1400,7 @@ function MemoriesScreen({ room, memories, retrospect, notes, onBack, onDeleteMem
       {weaving && <div className="msg msg-loading">（回想録を編んでいる）</div>}
       <ErrorBox error={error} />
 
+      {/* 回想録は「回想録を編む」でのみ更新する。編集・削除・追加のUIは付けない */}
       {retrospect && (
         <div className="memory-row">
           <div style={{ color: "var(--rule)", fontSize: 13, marginBottom: 6 }}>
@@ -1358,35 +1410,49 @@ function MemoriesScreen({ room, memories, retrospect, notes, onBack, onDeleteMem
         </div>
       )}
 
-      {sortedNotes.length > 0 && (
-        <div className="memory-row">
-          <div style={{ color: "var(--rule)", fontSize: 13 }}>
-            手控え ─ 会話の途中で書き付けたこと（回想録には編まれない）
-          </div>
-          {sortedNotes.map((n) => (
-            <div key={n.id} style={{ marginTop: 10 }}>
+      <div style={sectionHead}>
+        <span>手控え ─ 会話の途中で書き付けたこと（回想録には編まれない）</span>
+        <button style={smallBtn} onClick={() => startEdit("note", null)} disabled={busy}>書き足す</button>
+      </div>
+      {isEditing("note", null) && <div className="memory-row">{editor("書き足す")}</div>}
+      {sortedNotes.length === 0 && !isEditing("note", null) && <div className="empty-hint">まだ手控えはない。</div>}
+      {sortedNotes.map((n) => (
+        <div className="memory-row" key={n.id}>
+          {isEditing("note", n.id) ? editor("保存") : (
+            <>
               <div className="memory-text">{n.text}</div>
-              <div className="memory-date" style={{ marginTop: 2 }}>
+              <div className="memory-date">
                 {formatDateJP(n.createdAt)}
-                <button style={{ border: "none", marginLeft: 10, fontSize: 12 }} onClick={() => onDeleteNote(n.id)}>削除</button>
+                <button style={smallBtn} onClick={() => startEdit("note", n)} disabled={busy}>編集</button>
+                <button style={smallBtn} onClick={() => onDeleteNote(n.id)} disabled={busy}>削除</button>
               </div>
-            </div>
-          ))}
+            </>
+          )}
         </div>
-      )}
+      ))}
 
-      {sorted.length === 0 ? (
+      <div style={sectionHead}>
+        <span>記録帳</span>
+        <button style={smallBtn} onClick={() => startEdit("memory", null)} disabled={busy}>書き足す</button>
+      </div>
+      {isEditing("memory", null) && <div className="memory-row">{editor("書き足す")}</div>}
+      {sorted.length === 0 && !isEditing("memory", null) ? (
         <div className="empty-hint">まだ記録はない。</div>
       ) : (
         <div className="list">
           {sorted.map((m) => (
             <div className="memory-row" key={m.id}>
-              <div className="memory-text" style={m.woven ? { color: "var(--rule)" } : undefined}>{m.text}</div>
-              <div className="memory-date">
-                {m.woven && <span style={{ marginRight: 8 }}>編み済み</span>}
-                {formatDateJP(m.createdAt)}
-                <button style={{ border: "none", marginLeft: 10, fontSize: 12 }} onClick={() => onDeleteMemory(m.id)}>削除</button>
-              </div>
+              {isEditing("memory", m.id) ? editor("保存") : (
+                <>
+                  <div className="memory-text" style={m.woven ? { color: "var(--rule)" } : undefined}>{m.text}</div>
+                  <div className="memory-date">
+                    {m.woven && <span style={{ marginRight: 8 }}>編み済み</span>}
+                    {formatDateJP(m.createdAt)}
+                    <button style={smallBtn} onClick={() => startEdit("memory", m)} disabled={busy}>編集</button>
+                    <button style={smallBtn} onClick={() => onDeleteMemory(m.id)} disabled={busy}>削除</button>
+                  </div>
+                </>
+              )}
             </div>
           ))}
         </div>
@@ -1670,6 +1736,11 @@ function App() {
         onBack={goBack}
         onDeleteMemory={(id) => setMemories(memories.filter((m) => m.id !== id))}
         onDeleteNote={(id) => setNotes(notes.filter((n) => n.id !== id))}
+        // 編集・追加は痕跡を残さない（editedAt 等のフィールドを作らない）。text だけを差し替え、createdAt は保つ
+        onSaveMemory={(id, text) => setMemories(memories.map((m) => (m.id === id ? { ...m, text } : m)))}
+        onSaveNote={(id, text) => setNotes(notes.map((n) => (n.id === id ? { ...n, text } : n)))}
+        onAddMemory={(text) => setMemories([...memories, { id: uid(), roomId: room.id, text, createdAt: nowISO(), woven: false }])}
+        onAddNote={(text) => setNotes([...notes, { id: uid(), roomId: room.id, text, createdAt: nowISO() }])}
         onWeave={async () => {
           // 編む対象：woven に関わらず、全記録のうち直近10件を除いたものを古い順に全件。
           // 毎回全量から再生成することで、過去に編んだ内容の劣化コピーの連鎖を防ぐ。
