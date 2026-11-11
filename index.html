@@ -133,6 +133,8 @@
     color: var(--ink-model);
     white-space: pre-wrap;
   }
+  /* 完了時ジャンプで固定ヘッダーに隠れないように（実際の値は表示時に topbar の高さから設定し直す） */
+  .msg-model { scroll-margin-top: 88px; }
   .msg-user {
     font-family: "Zen Kaku Gothic New", sans-serif;
     font-size: 15px;
@@ -147,6 +149,8 @@
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent); }
   .usage-line { color: var(--rule); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .jotted-line { color: var(--rule); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; line-height: 1.6; }
+  .jotted-line + .jotted-line { margin-top: 2px; }
   .msg-tools { margin-top: 4px; }
   .msg-tools button { border: none; font-size: 12px; color: var(--rule); padding: 4px 6px; }
   .msg-tools button:hover, .msg-tools button:active { color: var(--accent); }
@@ -226,6 +230,7 @@ const K = {
   threads: "shosai_threads",
   memories: "shosai_memories",
   retrospects: "shosai_retrospects",
+  notes: "shosai_notes",
   lastThreadId: "shosai_last_thread_id",
 };
 
@@ -235,7 +240,22 @@ const RECENT_KEEP_COUNT = 10; // 「編む」とき、直近として個別注�
 const WEAVE_MIN_OLD = 5; // 直近を除いた未編み記録がこの件数に達したら「回想録を編む」を出す
 const BUNDLE_MAX_TOKENS = 1024;
 const RETROSPECT_MAX_TOKENS = 2048;
-const PAUSE_TURN_MAX_ROUNDS = 3; // pause_turn を継続する周回の上限（最初の1回を含む）
+const CONTINUATION_MAX_ROUNDS = 6; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
+const JOT_NOTE_MAX_CHARS = 120;
+const JOT_TOOL = {
+  name: "jot_note",
+  description:
+    "会話の途中で「これは残しておきたい」と思った事実・約束・好み・出来事を、その場で手控え帖に書き付ける。" +
+    "書き付けた内容は次回以降の会話で【手控え】としてあなたの手元に戻ってくる。回想録に溶けず、消されるまで残り続ける。" +
+    "本当に残したいことだけを、1件につき120字以内で簡潔に。会話の返事は通常どおり続けること。",
+  input_schema: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "書き付ける内容（120字以内）" },
+    },
+    required: ["text"],
+  },
+};
 const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
 次に会うときのあなたが読み返すものだ。
@@ -384,7 +404,15 @@ function formatYMD(iso) {
 function isValidBackup(data) {
   return !!data && data.app === "shiori"
     && Array.isArray(data.buildings) && Array.isArray(data.rooms)
-    && Array.isArray(data.threads) && Array.isArray(data.memories);
+    && Array.isArray(data.threads) && Array.isArray(data.memories)
+    // 手控えキーの無い旧バックアップも有効（復元時に [] 扱い）
+    && (data.notes === undefined || Array.isArray(data.notes));
+}
+
+// 手控えの本文を整える。120字超は先頭120字で切り詰める（エラーにはしない）。
+function normalizeJotText(text) {
+  const chars = Array.from(String(text == null ? "" : text).trim());
+  return chars.slice(0, JOT_NOTE_MAX_CHARS).join("");
 }
 
 function buildThreadText(building, room, thread) {
@@ -402,6 +430,17 @@ function buildThreadText(building, room, thread) {
     parts.push(`【${room.name}】\n${body}`);
   });
   return parts.join("\n\n") + "\n";
+}
+
+// ConfirmDialog は message を HTML として描くので、利用者の文章を差し込むときはエスケープする
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// 冒頭 n 字（超えたら「…」）。改行は空白にまとめる
+function excerpt(text, n) {
+  const chars = Array.from(String(text).replace(/\s+/g, " ").trim());
+  return chars.length > n ? chars.slice(0, n).join("") + "…" : chars.join("");
 }
 
 function roomPreview(systemPrompt) {
@@ -434,9 +473,104 @@ function buildApiError(status, json, model) {
   return new ShosaiError(`接続に失敗した。ネットワークか、APIキーを確認してほしい。(${status})`, { raw, status });
 }
 
+const STREAM_BROKEN_MESSAGE = "途中で筆が止まった。もう一度送ってみてほしい。";
+const TOOL_USE_BLOCK_TYPES = new Set(["tool_use", "server_tool_use", "mcp_tool_use"]);
+
+// SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
+// text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
+async function readAnthropicStream(res, onDelta) {
+  const content = [];
+  const partialJson = {}; // index → 連結中の input_json_delta
+  let usage = {};
+  let stopReason = null;
+  let finished = false;
+
+  function handleEvent(data) {
+    switch (data.type) {
+      case "message_start":
+        usage = { ...((data.message && data.message.usage) || {}) };
+        break;
+      case "content_block_start":
+        content[data.index] = { ...data.content_block };
+        break;
+      case "content_block_delta": {
+        const block = content[data.index];
+        const delta = data.delta || {};
+        if (!block) break;
+        if (delta.type === "text_delta") {
+          block.text = (block.text || "") + delta.text;
+          if (delta.text) onDelta(delta.text);
+        } else if (delta.type === "input_json_delta") {
+          partialJson[data.index] = (partialJson[data.index] || "") + (delta.partial_json || "");
+        } else if (delta.type === "citations_delta") {
+          block.citations = [...(block.citations || []), delta.citation];
+        }
+        break;
+      }
+      case "content_block_stop": {
+        const block = content[data.index];
+        if (block && TOOL_USE_BLOCK_TYPES.has(block.type)) {
+          const raw = partialJson[data.index] || "";
+          if (raw !== "") block.input = JSON.parse(raw);
+          else if (!block.input) block.input = {};
+        }
+        break;
+      }
+      case "message_delta":
+        if (data.delta && data.delta.stop_reason !== undefined) stopReason = data.delta.stop_reason;
+        // message_delta の usage（出力系・累積値）を message_start の入力系に重ねる。null は上書きしない
+        Object.entries(data.usage || {}).forEach(([k, v]) => { if (v !== null && v !== undefined) usage[k] = v; });
+        break;
+      case "message_stop":
+        finished = true;
+        break;
+      case "error": {
+        const msg = data.error && data.error.type === "overloaded_error"
+          ? "向こうが混んでいるだけで、こちらの問題ではない。少し待ってもう一度。"
+          : STREAM_BROKEN_MESSAGE;
+        throw new ShosaiError(msg, { raw: JSON.stringify(data, null, 2) });
+      }
+      default: // ping など
+        break;
+    }
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      if (done) buffer += decoder.decode() + "\n\n";
+      buffer = buffer.replace(/\r\n?/g, "\n");
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const chunk = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const dataLines = chunk.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).replace(/^ /, ""));
+        if (dataLines.length === 0) continue;
+        handleEvent(JSON.parse(dataLines.join("\n")));
+      }
+      if (done) break;
+    }
+  } catch (e) {
+    reader.cancel().catch(() => {}); // 既にエラーになったストリームでは cancel 自体が reject する
+    if (e instanceof ShosaiError) throw e;
+    throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: String(e) });
+  }
+  if (!finished) {
+    throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: "message_stop を受け取る前にストリームが終わった" });
+  }
+  return { content: content.filter(Boolean), stop_reason: stopReason, usage };
+}
+
 // Anthropic Messages APIをブラウザから直接呼ぶ唯一の窓口
 // body は buildRequestBody で組み立てたものをそのまま送る
-async function anthropicMessages({ apiKey, body }) {
+// onDelta が渡されたときだけストリーミングで受け取る（通常送信のみ）。返り値の形はどちらも同じ。
+async function anthropicMessages({ apiKey, body, onDelta }) {
+  const streaming = typeof onDelta === "function";
+  if (streaming) body = { ...body, stream: true };
   let res;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -453,10 +587,12 @@ async function anthropicMessages({ apiKey, body }) {
     throw new ShosaiError("接続に失敗した。ネットワークか、APIキーを確認してほしい。", { raw: String(e) });
   }
 
-  const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw buildApiError(res.status, json, body.model);
+    const errJson = await res.json().catch(() => null);
+    throw buildApiError(res.status, errJson, body.model);
   }
+  const json = streaming ? await readAnthropicStream(res, onDelta) : await res.json().catch(() => null);
+  if (!json) throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: "応答を読めなかった" });
   if (json.usage) {
     console.log("[書斎] usage", json.usage);
   }
@@ -465,31 +601,67 @@ async function anthropicMessages({ apiKey, body }) {
 
 // 棟のプロバイダを見て呼び先を切り替える。現時点ではanthropicのみ実装。
 // 将来 provider: "gemini" 等を追加する際はここに分岐を足すだけでよい。
-async function callModel({ building, apiKey, body }) {
+async function callModel({ building, apiKey, body, onDelta }) {
   switch (building.provider) {
     case "anthropic":
     default:
-      return anthropicMessages({ apiKey, body });
+      return anthropicMessages({ apiKey, body, onDelta });
   }
 }
 
-// pause_turn（検索の途中で一時返却）なら、返ってきた content を assistant として足して同じボディで再送する。
-// 全周回の content を順に連結して返す。usage・stop_reason は最終周のもの。
-async function callModelWithContinuation({ building, apiKey, body }) {
+// 応答を最後まで受け取るための継続ループ。
+// ・pause_turn（検索の途中で一時返却）なら、返ってきた content を assistant として足して同じボディで再送する。
+// ・tool_use（クライアントツール呼び出し）なら、jot_note の本文を jotted に積み、
+//   assistant（そのままの content）と user（全 tool_use_id への tool_result）を足して再送する。
+// 全周回の content を順に連結して返す。usage・stop_reason は最終周のもの。jotted はこの送信中に書き付けられた本文の配列。
+// 途中でエラーになった場合も、それまでの jotted を error.jotted に載せて投げ直す（記憶は記憶として残すため）。
+// onDelta（任意）は各周回にそのまま渡す。継続周回でも同じ流れとして文字が増えていく。
+async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
   const content = [];
+  const jotted = [];
   let json;
-  for (let round = 1; round <= PAUSE_TURN_MAX_ROUNDS; round++) {
-    json = await callModel({ building, apiKey, body });
-    console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
-    content.push(...(json.content || []));
-    if (json.stop_reason !== "pause_turn") break;
-    if (round === PAUSE_TURN_MAX_ROUNDS) {
-      console.warn("[書斎] pause_turn が上限に達したため打ち切り");
-      break;
+  try {
+    for (let round = 1; round <= CONTINUATION_MAX_ROUNDS; round++) {
+      json = await callModel({ building, apiKey, body, onDelta });
+      console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
+      const roundContent = json.content || [];
+      content.push(...roundContent);
+
+      let followUp;
+      if (json.stop_reason === "pause_turn") {
+        followUp = [{ role: "assistant", content: roundContent }];
+      } else if (json.stop_reason === "tool_use") {
+        // 1周に複数の tool_use があり得る。全 tool_use_id に tool_result を返すこと（欠けるとAPIエラー）
+        const toolResults = roundContent
+          .filter((b) => b.type === "tool_use")
+          .map((b) => {
+            if (b.name === JOT_TOOL.name) {
+              const text = normalizeJotText(b.input && b.input.text);
+              if (text) jotted.push(text);
+              return { type: "tool_result", tool_use_id: b.id, content: "書き付けた。" };
+            }
+            return { type: "tool_result", tool_use_id: b.id, content: "このツールは使えない。" };
+          });
+        if (toolResults.length === 0) break; // tool_use ブロックが無い tool_use 停止は継続しようがない
+        followUp = [
+          { role: "assistant", content: roundContent },
+          { role: "user", content: toolResults },
+        ];
+      } else {
+        break;
+      }
+
+      if (round === CONTINUATION_MAX_ROUNDS) {
+        console.warn(`[書斎] ${json.stop_reason} の継続が上限に達したため打ち切り`);
+        break;
+      }
+      body = { ...body, messages: [...body.messages, ...followUp] };
     }
-    body = { ...body, messages: [...body.messages, { role: "assistant", content: json.content }] };
+  } catch (e) {
+    if (jotted.length > 0) e.jotted = jotted;
+    throw e;
   }
-  return { content, usage: json.usage, stop_reason: json.stop_reason };
+  return { content, usage: json.usage, stop_reason: json.stop_reason, jotted };
 }
 
 // 通常送信と「記憶を綴じる」で共用するリクエストボディ。
@@ -497,18 +669,20 @@ async function callModelWithContinuation({ building, apiKey, body }) {
 // 綴じる用に別実装を書かないこと。
 // options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
 //          / block1Only（system をブロック1だけにする。「回想録を編む」用）
-function buildRequestBody({ building, room, memories, retrospects, frozenDate }, messagesToSend, options = {}) {
+function buildRequestBody({ building, room, memories, retrospects, notes, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
   const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
   const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
   const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
   const system = [block1];
   if (!options.block1Only) {
-    system.push({ type: "text", text: buildBlock2(room, memories, retrospects, frozenDate), cache_control: cc });
+    system.push({ type: "text", text: buildBlock2(room, memories, retrospects, notes, frozenDate), cache_control: cc });
   }
-  const tools = room.webSearch
-    ? [{ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES }]
-    : undefined;
+  // tools の構成は部屋設定だけで決まる（通常送信・綴じ・編むで一致させ、キャッシュのプレフィックスを揃える）
+  const toolList = [];
+  if (room.webSearch) toolList.push({ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES });
+  if (room.jotNote) toolList.push(JOT_TOOL);
+  const tools = toolList.length > 0 ? toolList : undefined;
   // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
   const sendable = messagesToSend.filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
   const payloadMessages = sendable.map((m, i) => {
@@ -539,7 +713,7 @@ function buildRequestBody({ building, room, memories, retrospects, frozenDate },
   return body;
 }
 
-function buildBlock2(room, memories, retrospects, frozenDate) {
+function buildBlock2(room, memories, retrospects, notes, frozenDate) {
   // 未編み記録は件数制限なしで全件注入する。編み済み（woven）は回想録に統合済みなので個別注入から外れる。
   const retrospect = retrospects && retrospects[room.id];
   const unwoven = memories
@@ -552,7 +726,14 @@ function buildBlock2(room, memories, retrospects, frozenDate) {
         ? "直近の記録はまだない。"
         : "まだ記録はない。今日が最初の日ということ。";
   const retrospectText = retrospect ? `【回想録 ─ 遠い記憶】\n${retrospect.text}\n\n` : "";
-  return `${retrospectText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
+  // 手控え（会話中にモデル本人が書き付けたもの）。回想録には編まれず、消されるまで残る。0件ならセクションごと出さない。
+  const roomNotes = (notes || [])
+    .filter((n) => n.roomId === room.id)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const notesText = roomNotes.length > 0
+    ? `【手控え ─ 会話の途中で自分が書き付けたこと】\n${roomNotes.map((n) => `・${formatYMD(n.createdAt)}：${n.text}`).join("\n")}\n\n`
+    : "";
+  return `${retrospectText}${notesText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
 }
 
 /* ===== データ層 ===== */
@@ -567,13 +748,14 @@ function seedInitialData() {
     { id: opusBuildingId, name: "Opus 4.6棟", provider: "anthropic", model: "claude-opus-4-6", createdAt: ts },
   ];
   const rooms = [
-    { id: fableRoomId, buildingId: fableBuildingId, name: "Fableの間", systemPrompt: FABLE_SYSTEM_PROMPT, webSearch: false, createdAt: ts },
+    { id: fableRoomId, buildingId: fableBuildingId, name: "Fableの間", systemPrompt: FABLE_SYSTEM_PROMPT, webSearch: false, jotNote: false, createdAt: ts },
   ];
   saveJSON(K.buildings, buildings);
   saveJSON(K.rooms, rooms);
   saveJSON(K.threads, []);
   saveJSON(K.memories, []);
   saveJSON(K.retrospects, {});
+  saveJSON(K.notes, []);
 }
 
 if (localStorage.getItem(K.buildings) === null) {
@@ -807,6 +989,7 @@ function RoomFormModal({ room, onCancel, onSave }) {
   const [name, setName] = useState(room ? room.name : "");
   const [systemPrompt, setSystemPrompt] = useState(room ? room.systemPrompt : "");
   const [webSearch, setWebSearch] = useState(room ? room.webSearch : false);
+  const [jotNote, setJotNote] = useState(room ? !!room.jotNote : false);
   const [cacheTtl, setCacheTtl] = useState(room && room.cacheTtl === "1h" ? "1h" : "5m");
 
   return (
@@ -829,6 +1012,15 @@ function RoomFormModal({ room, onCancel, onSave }) {
             onChange={(e) => setWebSearch(e.target.checked)}
           />
           <label htmlFor="websearch-toggle" style={{ margin: 0 }}>ウェブ検索を有効にする</label>
+        </div>
+        <div className="field toggle-row">
+          <input
+            type="checkbox"
+            id="jotnote-toggle"
+            checked={jotNote}
+            onChange={(e) => setJotNote(e.target.checked)}
+          />
+          <label htmlFor="jotnote-toggle" style={{ margin: 0 }}>手控え（会話中の書き付け）</label>
         </div>
         <div className="field">
           <label>記憶の栞（キャッシュ寿命）</label>
@@ -858,7 +1050,7 @@ function RoomFormModal({ room, onCancel, onSave }) {
           <button
             className="accent"
             disabled={!name.trim()}
-            onClick={() => onSave({ name: name.trim(), systemPrompt, webSearch, cacheTtl })}
+            onClick={() => onSave({ name: name.trim(), systemPrompt, webSearch, jotNote, cacheTtl })}
           >
             保存する
           </button>
@@ -985,9 +1177,21 @@ function UsageLine({ usage, stopReason }) {
   return <div className="usage-line">{prefix}{text}</div>;
 }
 
+// モデル発言の下に出す「書き付けた」行。jotted の無い過去メッセージには何も出さない。
+function JottedLine({ jotted }) {
+  if (!Array.isArray(jotted) || jotted.length === 0) return null;
+  return (
+    <>
+      {jotted.map((text, i) => (
+        <div className="jotted-line" key={i}>✎ 書き付けた ─ {text}</div>
+      ))}
+    </>
+  );
+}
+
 function ConversationScreen({
-  apiKey, building, room, thread, memories, retrospects,
-  onBack, onUpdateThread, onOpenBundleMemory, onOpenMemories,
+  apiKey, building, room, thread, memories, retrospects, notes,
+  onBack, onUpdateThread, onAddNotes, onOpenBundleMemory, onOpenMemories,
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -997,25 +1201,79 @@ function ConversationScreen({
   const [editingIndex, setEditingIndex] = useState(null);
   const [editText, setEditText] = useState("");
   const [confirmResend, setConfirmResend] = useState(null); // { index, count }
+  const [streamText, setStreamText] = useState(""); // ストリーミング中の本文（保存前のプレーン表示用）
   const bottomRef = useRef(null);
+  const lastAssistantRef = useRef(null); // 最後のメッセージが assistant のときだけ付く
+  const followRef = useRef(true); // ストリーミング中に下端へ追尾するか（手で上にスクロールしたら止める）
+  const autoScrollYRef = useRef(null); // 追尾で最後に合わせた scrollY（これより上にいれば手で戻したとみなす）
+  const jumpPendingRef = useRef(false); // 保存直後、その発言の頭へジャンプする
+  const jumpedRef = useRef(false); // ジャンプ後、次の送信まで「最下部へ」を抑える
+  const streamedTsRef = useRef(null); // ストリーミング表示から切り替わった発言（フェードインを省き、ちらつかせない）
+
+  function scrollToBottom() {
+    window.scrollTo({ top: document.documentElement.scrollHeight });
+  }
 
   useEffect(() => {
+    // 完了時：保存した assistant 発言の先頭を、固定ヘッダーの下に合わせる（即時）
+    if (jumpPendingRef.current && lastAssistantRef.current) {
+      jumpPendingRef.current = false;
+      jumpedRef.current = true;
+      const el = lastAssistantRef.current;
+      const topbar = document.querySelector(".topbar");
+      if (topbar) el.style.scrollMarginTop = `${topbar.offsetHeight + 8}px`;
+      el.scrollIntoView({ block: "start" });
+      return;
+    }
+    if (jumpedRef.current) return;
     // 入力欄が画面下部に固定されているため、末尾要素ではなくページ最下部までスクロールして
     // 最新メッセージが入力欄の裏に隠れないようにする。
-    if (bottomRef.current) {
-      window.scrollTo({ top: document.documentElement.scrollHeight });
-    }
+    if (bottomRef.current) scrollToBottom();
   }, [thread.messages.length, sending]);
+
+  // ストリーミング中の追尾。下端から120px以上離れている間（手で上に戻したとき）は追わない
+  useEffect(() => {
+    function handleScroll() {
+      const el = document.documentElement;
+      followRef.current = el.scrollHeight - (window.scrollY + window.innerHeight) < 120;
+    }
+    window.addEventListener("scroll", handleScroll, { passive: true });
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  useEffect(() => {
+    if (!streamText) { autoScrollYRef.current = null; return; }
+    // scroll イベントより先に次の文字が届いた場合に備え、前回の追尾位置より上にいれば追尾を止める
+    if (autoScrollYRef.current !== null && window.scrollY < autoScrollYRef.current - 2) followRef.current = false;
+    if (!followRef.current) return;
+    scrollToBottom();
+    autoScrollYRef.current = window.scrollY;
+  }, [streamText]);
 
   // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
   async function sendToModel(nextMessages) {
     setError(null);
+    jumpedRef.current = false;
+    jumpPendingRef.current = false;
+    followRef.current = true;
+    setStreamText("");
     onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
 
     try {
-      const body = buildRequestBody({ building, room, memories, retrospects, frozenDate: thread.frozenDate }, nextMessages);
-      const json = await callModelWithContinuation({ building, apiKey, body });
+      const body = buildRequestBody({ building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages);
+      let json;
+      try {
+        json = await callModelWithContinuation({
+          building, apiKey, body, onDelta: (t) => setStreamText((prev) => prev + t),
+        });
+      } catch (e) {
+        // 途中で失敗しても、それまでに書き付けられた手控えは残す
+        if (e.jotted) onAddNotes(e.jotted);
+        throw e;
+      }
+      // 手控えは応答の成否（空応答・refusal を含む）に関わらず保存する
+      if (json.jotted.length > 0) onAddNotes(json.jotted);
 
       // 空応答は保存しない。送ったユーザー発言は残すので、編集＆再送信でやり直せる。
       if (!hasVisibleText(json.content)) {
@@ -1026,13 +1284,20 @@ function ConversationScreen({
         throw new ShosaiError(message, { raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2) });
       }
 
+      // クライアントツールの tool_use ブロックは保存しない（直後に tool_result が無い形で再送するとAPIに弾かれるため）。
+      // server_tool_use / web_search_tool_result は assistant content 内で完結するのでそのまま残す。
       const assistantMessage = {
-        role: "assistant", content: json.content, ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
+        role: "assistant", content: json.content.filter((b) => b.type !== "tool_use"),
+        ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
+      if (json.jotted.length > 0) assistantMessage.jotted = json.jotted;
+      jumpPendingRef.current = true;
+      streamedTsRef.current = assistantMessage.ts;
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
     } catch (e) {
       setError(e);
     } finally {
+      setStreamText("");
       setSending(false);
     }
   }
@@ -1137,7 +1402,12 @@ function ConversationScreen({
           <div className="empty-hint">まだ何もない。話しかけてみてほしい。</div>
         )}
         {thread.messages.map((m, i) => (
-          <div className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}`} key={i}>
+          <div
+            className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}`}
+            key={i}
+            style={m.ts && m.ts === streamedTsRef.current ? { animation: "none" } : undefined}
+            ref={m.role === "assistant" && i === thread.messages.length - 1 ? lastAssistantRef : undefined}
+          >
             {m.role === "user" && editingIndex === i ? (
               <div className="msg-edit">
                 <textarea value={editText} onChange={(e) => setEditText(e.target.value)} autoFocus />
@@ -1154,11 +1424,14 @@ function ConversationScreen({
                 <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
               </div>
             )}
+            {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
             {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} />}
           </div>
         ))}
         {sending && (
-          <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>
+          streamText
+            ? <div className="msg msg-model">{streamText}</div>
+            : <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>
         )}
         {bundling && <div className="msg msg-loading">（記憶を綴じている）</div>}
         <div ref={bottomRef} />
@@ -1194,16 +1467,39 @@ function ConversationScreen({
 
 /* ===== 記録帳 ===== */
 
-function MemoriesScreen({ room, memories, retrospect, onBack, onDeleteMemory, onWeave }) {
+// 記録帳画面のインライン編集欄（会話画面の自分発言編集と同じ見た目）。空白のみでは確定できない。
+function InlineTextEditor({ value, onChange, confirmLabel, onCancel, onConfirm }) {
+  return (
+    <div className="msg-edit">
+      <textarea value={value} onChange={(e) => onChange(e.target.value)} autoFocus />
+      <div className="composer-row">
+        <button onClick={onCancel}>やめる</button>
+        <button className="accent" onClick={onConfirm} disabled={!value.trim()}>{confirmLabel}</button>
+      </div>
+    </div>
+  );
+}
+
+function MemoriesScreen({
+  room, memories, retrospect, notes, onBack,
+  onDeleteMemory, onDeleteNote, onSaveMemory, onSaveNote, onAddMemory, onAddNote, onWeave,
+}) {
   const [weaving, setWeaving] = useState(false);
   const [confirmWeave, setConfirmWeave] = useState(false);
   const [error, setError] = useState(null);
+  // 編集・追加は同時に1件まで。{ kind: "memory" | "note", id: 既存なら id、新規なら null }
+  const [editing, setEditing] = useState(null);
+  const [editText, setEditText] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(null); // { kind: "memory" | "note", item }
+  const busy = editing !== null || weaving;
 
   const sorted = [...memories].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const unwoven = memories.filter((m) => !m.woven);
   // 「編む」は、直近10件を除いた未編み記録が5件以上あるときだけ出す（＝未編み15件以上）
   const canWeave = unwoven.length >= RECENT_KEEP_COUNT + WEAVE_MIN_OLD;
-  const charCount = unwoven.reduce((sum, m) => sum + m.text.length, 0) + (retrospect ? retrospect.text.length : 0);
+  const sortedNotes = [...notes].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  const charCount = unwoven.reduce((sum, m) => sum + m.text.length, 0) + (retrospect ? retrospect.text.length : 0)
+    + notes.reduce((sum, n) => sum + n.text.length, 0);
 
   async function handleWeave() {
     setConfirmWeave(false);
@@ -1218,6 +1514,37 @@ function MemoriesScreen({ room, memories, retrospect, onBack, onDeleteMemory, on
     }
   }
 
+  function startEdit(kind, item) {
+    if (busy) return;
+    setEditing({ kind, id: item ? item.id : null });
+    setEditText(item ? item.text : "");
+  }
+
+  function cancelEdit() {
+    setEditing(null);
+    setEditText("");
+  }
+
+  // 痕跡は残さない：text 以外（createdAt 等）は変えず、編集済みの印も付けない
+  function confirmEdit() {
+    const text = editText.trim();
+    if (!editing || !text) return;
+    const { kind, id } = editing;
+    if (kind === "memory") {
+      if (id) onSaveMemory(id, text); else onAddMemory(text);
+    } else {
+      if (id) onSaveNote(id, text); else onAddNote(text);
+    }
+    cancelEdit();
+  }
+
+  const isEditing = (kind, id) => editing && editing.kind === kind && editing.id === id;
+  const editor = (label) => (
+    <InlineTextEditor value={editText} onChange={setEditText} confirmLabel={label} onCancel={cancelEdit} onConfirm={confirmEdit} />
+  );
+  const smallBtn = { border: "none", marginLeft: 10, fontSize: 12 };
+  const sectionHead = { display: "flex", justifyContent: "space-between", alignItems: "baseline", color: "var(--rule)", fontSize: 13, marginTop: 20 };
+
   return (
     <div className="page">
       <div className="topbar">
@@ -1228,18 +1555,19 @@ function MemoriesScreen({ room, memories, retrospect, onBack, onDeleteMemory, on
         </div>
         {canWeave && (
           <div className="topbar-actions">
-            <button onClick={() => setConfirmWeave(true)} disabled={weaving}>回想録を編む</button>
+            <button onClick={() => setConfirmWeave(true)} disabled={busy}>回想録を編む</button>
           </div>
         )}
       </div>
 
       <div className="usage-line" style={{ marginTop: 0, marginBottom: 16 }}>
-        いま栞が携えている記憶：未編みの記録 {unwoven.length}件{retrospect ? " ＋ 回想録" : ""} ／ 約{charCount.toLocaleString()}字
+        いま栞が携えている記憶：未編みの記録 {unwoven.length}件{retrospect ? " ＋ 回想録" : ""}{notes.length > 0 ? ` ＋ 手控え ${notes.length}件` : ""} ／ 約{charCount.toLocaleString()}字
       </div>
 
       {weaving && <div className="msg msg-loading">（回想録を編んでいる）</div>}
       <ErrorBox error={error} />
 
+      {/* 回想録は「回想録を編む」でのみ更新する。編集・削除・追加のUIは付けない */}
       {retrospect && (
         <div className="memory-row">
           <div style={{ color: "var(--rule)", fontSize: 13, marginBottom: 6 }}>
@@ -1249,21 +1577,65 @@ function MemoriesScreen({ room, memories, retrospect, onBack, onDeleteMemory, on
         </div>
       )}
 
-      {sorted.length === 0 ? (
+      <div style={sectionHead}>
+        <span>手控え ─ 会話の途中で書き付けたこと（回想録には編まれない）</span>
+        <button style={smallBtn} onClick={() => startEdit("note", null)} disabled={busy}>書き足す</button>
+      </div>
+      {isEditing("note", null) && <div className="memory-row">{editor("書き足す")}</div>}
+      {sortedNotes.length === 0 && !isEditing("note", null) && <div className="empty-hint">まだ手控えはない。</div>}
+      {sortedNotes.map((n) => (
+        <div className="memory-row" key={n.id}>
+          {isEditing("note", n.id) ? editor("保存") : (
+            <>
+              <div className="memory-text">{n.text}</div>
+              <div className="memory-date">
+                {formatDateJP(n.createdAt)}
+                <button style={smallBtn} onClick={() => startEdit("note", n)} disabled={busy}>編集</button>
+                <button style={smallBtn} onClick={() => setConfirmDelete({ kind: "note", item: n })} disabled={busy}>削除</button>
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+
+      <div style={sectionHead}>
+        <span>記録帳</span>
+        <button style={smallBtn} onClick={() => startEdit("memory", null)} disabled={busy}>書き足す</button>
+      </div>
+      {isEditing("memory", null) && <div className="memory-row">{editor("書き足す")}</div>}
+      {sorted.length === 0 && !isEditing("memory", null) ? (
         <div className="empty-hint">まだ記録はない。</div>
       ) : (
         <div className="list">
           {sorted.map((m) => (
             <div className="memory-row" key={m.id}>
-              <div className="memory-text" style={m.woven ? { color: "var(--rule)" } : undefined}>{m.text}</div>
-              <div className="memory-date">
-                {m.woven && <span style={{ marginRight: 8 }}>編み済み</span>}
-                {formatDateJP(m.createdAt)}
-                <button style={{ border: "none", marginLeft: 10, fontSize: 12 }} onClick={() => onDeleteMemory(m.id)}>削除</button>
-              </div>
+              {isEditing("memory", m.id) ? editor("保存") : (
+                <>
+                  <div className="memory-text" style={m.woven ? { color: "var(--rule)" } : undefined}>{m.text}</div>
+                  <div className="memory-date">
+                    {m.woven && <span style={{ marginRight: 8 }}>編み済み</span>}
+                    {formatDateJP(m.createdAt)}
+                    <button style={smallBtn} onClick={() => startEdit("memory", m)} disabled={busy}>編集</button>
+                    <button style={smallBtn} onClick={() => setConfirmDelete({ kind: "memory", item: m })} disabled={busy}>削除</button>
+                  </div>
+                </>
+              )}
             </div>
           ))}
         </div>
+      )}
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title={confirmDelete.kind === "note" ? "手控えを消す" : "記録を消す"}
+          message={`この${confirmDelete.kind === "note" ? "手控え" : "記録"}を消す。『${escapeHtml(excerpt(confirmDelete.item.text, 20))}』。よい？`}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => {
+            if (confirmDelete.kind === "note") onDeleteNote(confirmDelete.item.id);
+            else onDeleteMemory(confirmDelete.item.id);
+            setConfirmDelete(null);
+          }}
+        />
       )}
 
       {confirmWeave && (
@@ -1289,6 +1661,7 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
   const [editingKey, setEditingKey] = useState(false);
   const [keyValue, setKeyValue] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [confirmDeleteKey, setConfirmDeleteKey] = useState(false);
   const [pendingBackup, setPendingBackup] = useState(null);
   const [importError, setImportError] = useState(null);
   const fileInputRef = useRef(null);
@@ -1332,7 +1705,7 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
             <span>{apiKey ? "•••• " + apiKey.slice(-4) : "未設定"}</span>
             <div className="row-actions">
               <button onClick={() => setEditingKey(true)}>変更</button>
-              <button onClick={onDeleteApiKey}>削除</button>
+              <button onClick={() => setConfirmDeleteKey(true)}>削除</button>
             </div>
           </div>
         )}
@@ -1373,6 +1746,15 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
           <button className="danger" onClick={() => setConfirmWipe(true)}>全消去</button>
         </div>
       </div>
+
+      {confirmDeleteKey && (
+        <ConfirmDialog
+          title="APIキーを消す"
+          message="APIキーを消す。会話や記録は残る。キーを入れ直せばまた使える。よい？"
+          onCancel={() => setConfirmDeleteKey(false)}
+          onConfirm={() => { setConfirmDeleteKey(false); onDeleteApiKey(); }}
+        />
+      )}
 
       {confirmWipe && (
         <ConfirmDialog
@@ -1415,6 +1797,7 @@ function App() {
   const [threads, setThreadsState] = useState(() => loadJSON(K.threads, []));
   const [memories, setMemoriesState] = useState(() => loadJSON(K.memories, []));
   const [retrospects, setRetrospectsState] = useState(() => loadJSON(K.retrospects, {}));
+  const [notes, setNotesState] = useState(() => loadJSON(K.notes, []));
   const [route, setRoute] = useState(() => computeInitialRoute());
 
   function computeInitialRoute() {
@@ -1474,6 +1857,13 @@ function App() {
   function setThreads(next) { setThreadsState(next); saveJSON(K.threads, next); }
   function setMemories(next) { setMemoriesState(next); saveJSON(K.memories, next); }
   function setRetrospects(next) { setRetrospectsState(next); saveJSON(K.retrospects, next); }
+  function setNotes(next) { setNotesState(next); saveJSON(K.notes, next); }
+  // 手控えの追記。送信は非同期で終わるため、レンダー時点の notes ではなく保存済みの最新から足す。
+  function addNotes(roomId, texts) {
+    const ts = nowISO();
+    const added = texts.map((text) => ({ id: uid(), roomId, text, createdAt: ts }));
+    setNotes([...loadJSON(K.notes, []), ...added]);
+  }
 
   if (!apiKey) {
     return (
@@ -1505,7 +1895,7 @@ function App() {
         }}
         onExportBackup={() => {
           // APIキー・テーマ・lastThreadId は含めない
-          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects };
+          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes };
           downloadFile(`shiori_backup_${todayYMD()}.json`, JSON.stringify(data, null, 2), "application/json");
         }}
         onRestoreBackup={(data) => {
@@ -1516,6 +1906,8 @@ function App() {
           saveJSON(K.memories, data.memories);
           // 回想録キーの無い旧バックアップも読み込める
           saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {});
+          // 手控えキーの無い旧バックアップも読み込める
+          saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []);
           localStorage.removeItem(K.lastThreadId);
           window.location.reload();
         }}
@@ -1530,8 +1922,15 @@ function App() {
         room={room}
         memories={roomMemories}
         retrospect={retrospects[room.id] || null}
+        notes={notes.filter((n) => n.roomId === room.id)}
         onBack={goBack}
         onDeleteMemory={(id) => setMemories(memories.filter((m) => m.id !== id))}
+        onDeleteNote={(id) => setNotes(notes.filter((n) => n.id !== id))}
+        // 編集・追加は痕跡を残さない（editedAt 等のフィールドを作らない）。text だけを差し替え、createdAt は保つ
+        onSaveMemory={(id, text) => setMemories(memories.map((m) => (m.id === id ? { ...m, text } : m)))}
+        onSaveNote={(id, text) => setNotes(notes.map((n) => (n.id === id ? { ...n, text } : n)))}
+        onAddMemory={(text) => setMemories([...memories, { id: uid(), roomId: room.id, text, createdAt: nowISO(), woven: false }])}
+        onAddNote={(text) => setNotes([...notes, { id: uid(), roomId: room.id, text, createdAt: nowISO() }])}
         onWeave={async () => {
           // 編む対象：woven に関わらず、全記録のうち直近10件を除いたものを古い順に全件。
           // 毎回全量から再生成することで、過去に編んだ内容の劣化コピーの連鎖を防ぐ。
@@ -1539,9 +1938,9 @@ function App() {
           const targets = sortedAsc.slice(0, Math.max(0, sortedAsc.length - RECENT_KEEP_COUNT));
           const listing = targets.map((m) => `${formatYMD(m.createdAt)}：${m.text}`).join("\n");
           // system はブロック1のみ（通常送信と同一コード経路・同一 cache_control）。
-          // tools はウェブ検索ONなら通常どおり付き、tool_choice: none で実行だけを封じる。
+          // tools は部屋設定どおり付き、tool_choice: none で実行だけを封じる。手控え（notes）は編む対象に入れない。
           const body = buildRequestBody(
-            { building, room, memories, retrospects, frozenDate: "" },
+            { building, room, memories, retrospects, notes, frozenDate: "" },
             [],
             {
               maxTokens: RETROSPECT_MAX_TOKENS,
@@ -1576,17 +1975,19 @@ function App() {
         thread={thread}
         memories={memories}
         retrospects={retrospects}
+        notes={notes}
         onBack={goBack}
         onUpdateThread={(updated) => {
           setThreads(threads.map((t) => (t.id === updated.id ? updated : t)));
         }}
+        onAddNotes={(texts) => addNotes(room.id, texts)}
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
         onOpenBundleMemory={async () => {
           // 棟のモデル本人が、会話の続きとして自分で綴じる。
           // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
           // 綴じ指示と応答は thread.messages に保存しない。
           const body = buildRequestBody(
-            { building, room, memories, retrospects, frozenDate: thread.frozenDate },
+            { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate },
             thread.messages,
             {
               maxTokens: BUNDLE_MAX_TOKENS,
@@ -1594,7 +1995,15 @@ function App() {
               extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
             },
           );
-          const json = await callModelWithContinuation({ building, apiKey, body });
+          let json;
+          try {
+            json = await callModelWithContinuation({ building, apiKey, body });
+          } catch (e) {
+            if (e.jotted) addNotes(room.id, e.jotted);
+            throw e;
+          }
+          // tool_choice: none なので通常は呼ばれないが、万一書き付けられたら手控えとして残す
+          if (json.jotted.length > 0) addNotes(room.id, json.jotted);
           console.log("[書斎] bundle usage", json.usage);
           const text = extractPlainText(json.content).trim();
           if (!text) {
@@ -1663,6 +2072,7 @@ function App() {
           const doomedThreadIds = new Set(threads.filter((t) => t.roomId === roomId).map((t) => t.id));
           setThreads(threads.filter((t) => t.roomId !== roomId));
           setMemories(memories.filter((m) => m.roomId !== roomId));
+          setNotes(notes.filter((n) => n.roomId !== roomId));
           if (retrospects[roomId]) {
             const nextRetrospects = { ...retrospects };
             delete nextRetrospects[roomId];
@@ -1695,6 +2105,7 @@ function App() {
         setRooms(rooms.filter((r) => r.buildingId !== buildingId));
         setThreads(threads.filter((t) => !doomedRoomIds.has(t.roomId)));
         setMemories(memories.filter((m) => !doomedRoomIds.has(m.roomId)));
+        setNotes(notes.filter((n) => !doomedRoomIds.has(n.roomId)));
         const nextRetrospects = { ...retrospects };
         doomedRoomIds.forEach((id) => delete nextRetrospects[id]);
         setRetrospects(nextRetrospects);
