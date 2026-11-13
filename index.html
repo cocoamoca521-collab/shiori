@@ -490,9 +490,16 @@ async function readAnthropicStream(res, onDelta) {
       case "message_start":
         usage = { ...((data.message && data.message.usage) || {}) };
         break;
-      case "content_block_start":
-        content[data.index] = { ...data.content_block };
+      case "content_block_start": {
+        const block = { ...data.content_block };
+        // thinking ブロックは本文・署名ともデルタで届く。再送時に必須なので文字列で初期化しておく
+        if (block.type === "thinking") {
+          if (typeof block.thinking !== "string") block.thinking = "";
+          if (typeof block.signature !== "string") block.signature = "";
+        }
+        content[data.index] = block;
         break;
+      }
       case "content_block_delta": {
         const block = content[data.index];
         const delta = data.delta || {};
@@ -502,6 +509,10 @@ async function readAnthropicStream(res, onDelta) {
           if (delta.text) onDelta(delta.text);
         } else if (delta.type === "input_json_delta") {
           partialJson[data.index] = (partialJson[data.index] || "") + (delta.partial_json || "");
+        } else if (delta.type === "thinking_delta") {
+          block.thinking = (block.thinking || "") + (delta.thinking || ""); // 表示には流さない
+        } else if (delta.type === "signature_delta") {
+          block.signature = (block.signature || "") + (delta.signature || "");
         } else if (delta.type === "citations_delta") {
           block.citations = [...(block.citations || []), delta.citation];
         }
@@ -684,7 +695,10 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   if (room.jotNote) toolList.push(JOT_TOOL);
   const tools = toolList.length > 0 ? toolList : undefined;
   // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
-  const sendable = messagesToSend.filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
+  // 署名の無い thinking ブロック（旧ストリーミング処理が壊して保存したもの）は再送できないので外す
+  const sendable = messagesToSend
+    .filter((m) => m.role !== "assistant" || hasVisibleText(m.content))
+    .map((m) => (m.role === "assistant" && Array.isArray(m.content) ? { ...m, content: sanitizeThinkingBlocks(m.content) } : m));
   const payloadMessages = sendable.map((m, i) => {
     if (i !== sendable.length - 1) {
       return { role: m.role, content: m.content };
@@ -711,6 +725,11 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   if (tools) body.tools = tools;
   if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
   return body;
+}
+
+// 再送できない thinking ブロック（署名が空・本文フィールドが無い）を取り除く。正常なブロックはそのまま返す
+function sanitizeThinkingBlocks(content) {
+  return content.filter((b) => b.type !== "thinking" || (typeof b.signature === "string" && b.signature !== "" && typeof b.thinking === "string"));
 }
 
 function buildBlock2(room, memories, retrospects, notes, frozenDate) {
