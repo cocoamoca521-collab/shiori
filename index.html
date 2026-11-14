@@ -265,7 +265,9 @@ const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ・400字以内
 ・一人称で書く
 ・事実の要点だけでなく、心に残ったことがあればそれも
-・記録の本文だけを出力すること。前置き・後書き・見出し・括弧書きの注釈は不要`;
+・記録の本文だけを出力すること。前置き・後書き・見出し・括弧書きの注釈は不要
+・長く思案しなくてよい。すぐに書き始めること
+・考えを巡らせた場合も、その結果は必ず応答本文として書き出すこと。思考の中で完結させて応答を空のまま終えてはならない`;
 
 // 「回想録を編む」の指示文。この後ろに古い記録を古い順で列挙して送る（各件「YYYY-MM-DD：本文」）
 const WEAVE_INSTRUCTION = `これはこの部屋の古い記録帳だ。直近の記録とは別に、遠い記憶として手元に置いておくためのもの。
@@ -276,6 +278,8 @@ const WEAVE_INSTRUCTION = `これはこの部屋の古い記録帳だ。直近�
 ・時系列は保つが、日記の羅列ではなく、振り返りの文章として
 ・大事な出来事・約束・変化・心に残ったことを優先し、細部は思い切って手放してよい
 ・回想録の本文だけを出力すること。前置き・後書き・見出しは不要
+・長く思案しなくてよい。すぐに書き始めること
+・考えを巡らせた場合も、その結果は必ず応答本文として書き出すこと。思考の中で完結させて応答を空のまま終えてはならない
 
 【古い記録】
 `;
@@ -371,6 +375,16 @@ function extractPlainText(content) {
 // 空白以外のテキストを持つ text ブロックが1つでもあるか。無ければ「空応答」として扱う。
 function hasVisibleText(content) {
   return extractPlainText(content).trim() !== "";
+}
+
+// 空応答エラーの「詳細を見る」用。ブロック種別一覧と、text ブロックがあればその文字数も出す
+// （「text ブロック自体が無い」のか「空の text ブロックが来ている」のかを区別するため）
+function emptyResponseDetail(json) {
+  const content = Array.isArray(json.content) ? json.content : [];
+  const detail = { stop_reason: json.stop_reason, usage: json.usage, content_types: content.map((b) => b.type) };
+  const texts = content.filter((b) => b.type === "text");
+  if (texts.length > 0) detail.text_chars = texts.reduce((sum, b) => sum + (b.text || "").length, 0);
+  return JSON.stringify(detail, null, 2);
 }
 
 // ファイル名に使えない文字（/ \ : * ? " < > | と改行）を _ に置き換える
@@ -682,11 +696,20 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
 // 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
 // 2回とも空なら最後の結果をそのまま返し、空応答のエラー表示は呼び出し側の既存判定に任せる。
 // 通常会話の送信には使わないこと（そちらはエラー表示→ユーザーが再送）。
+// effort に対応しないモデル（Haiku 4.5 など）で output_config が400になった場合は、effort を外して送り直す。
 async function callModelRetryOnEmpty(args, onJotted) {
   let json;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      json = await callModelWithContinuation(args);
+      try {
+        json = await callModelWithContinuation(args);
+      } catch (e) {
+        if (!(e.status === 400 && args.body.output_config && /effort|output_config/i.test(e.raw || ""))) throw e;
+        console.warn("[書斎] このモデルは effort に対応していないため、外して送り直す", e.raw);
+        const { output_config, ...bodyWithoutEffort } = args.body;
+        args = { ...args, body: bodyWithoutEffort };
+        json = await callModelWithContinuation(args);
+      }
     } catch (e) {
       if (e.jotted && onJotted) onJotted(e.jotted);
       throw e;
@@ -703,6 +726,8 @@ async function callModelRetryOnEmpty(args, onJotted) {
 // 綴じる用に別実装を書かないこと。
 // options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
 //          / block1Only（system をブロック1だけにする。「回想録を編む」用）
+//          / effort（output_config.effort。綴じ・編みだけが "low" を渡す。通常送信には付けない）
+//          thinking パラメータは一切送らない（Opus 5.5 等では disabled も enabled も400になる）
 function buildRequestBody({ building, room, memories, retrospects, notes, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
   const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
@@ -747,6 +772,7 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   };
   if (tools) body.tools = tools;
   if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
+  if (options.effort) body.output_config = { effort: options.effort };
   return body;
 }
 
@@ -1323,7 +1349,7 @@ function ConversationScreen({
         const message = json.stop_reason === "refusal"
           ? "この話題には筆を執れなかったようだ。言い回しを変えて、もう一度試してみてほしい。"
           : `返事が綴られなかった（${json.stop_reason}）。もう一度送ってみてほしい。`;
-        throw new ShosaiError(message, { raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2) });
+        throw new ShosaiError(message, { raw: emptyResponseDetail(json) });
       }
 
       // 保存しないブロック：
@@ -1991,6 +2017,7 @@ function App() {
             {
               maxTokens: RETROSPECT_MAX_TOKENS,
               toolChoice: { type: "none" },
+              effort: "low", // 思考の中で書き終えて本文が空になるのを防ぐ
               block1Only: true,
               extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
             },
@@ -2001,7 +2028,7 @@ function App() {
           if (!text) {
             console.warn("[書斎] 編み空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("回想録が編めなかった。もう一度試してみてほしい。", {
-              raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2),
+              raw: emptyResponseDetail(json),
             });
           }
           const targetIds = new Set(targets.map((m) => m.id));
@@ -2038,6 +2065,7 @@ function App() {
             {
               maxTokens: BUNDLE_MAX_TOKENS,
               toolChoice: { type: "none" }, // tools は外さず、検索の実行だけを封じる
+              effort: "low", // 思考の中で書き終えて本文が空になるのを防ぐ
               extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
             },
           );
@@ -2048,7 +2076,7 @@ function App() {
           if (!text) {
             console.warn("[書斎] 綴じ空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("記録が綴られなかった。もう一度試してみてほしい。", {
-              raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2),
+              raw: emptyResponseDetail(json),
             });
           }
           const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
