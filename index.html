@@ -238,8 +238,10 @@ const WEB_SEARCH_MAX_USES = 3;
 const MAX_TOKENS = 4096;
 const RECENT_KEEP_COUNT = 10; // 「編む」とき、直近として個別注入に残す記録の件数
 const WEAVE_MIN_OLD = 5; // 直近を除いた未編み記録がこの件数に達したら「回想録を編む」を出す
-const BUNDLE_MAX_TOKENS = 1024;
-const RETROSPECT_MAX_TOKENS = 2048;
+// 綴じ・編みの出力上限。思考が常時ONのモデル（Opus 5.5 等）では思考トークンもこの上限に含まれるため、
+// 本文を書く余地を残せるよう大きめに取る（課金は実際に使った分だけ）
+const BUNDLE_MAX_TOKENS = 4096;
+const RETROSPECT_MAX_TOKENS = 4096;
 const CONTINUATION_MAX_ROUNDS = 6; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
 const JOT_NOTE_MAX_CHARS = 120;
 const JOT_TOOL = {
@@ -475,6 +477,8 @@ function buildApiError(status, json, model) {
 
 const STREAM_BROKEN_MESSAGE = "途中で筆が止まった。もう一度送ってみてほしい。";
 const TOOL_USE_BLOCK_TYPES = new Set(["tool_use", "server_tool_use", "mcp_tool_use"]);
+// thread.messages に保存しない assistant ブロックの種類（理由は sendToModel の保存箇所を参照）
+const UNSAVED_BLOCK_TYPES = new Set(["tool_use", "thinking", "redacted_thinking"]);
 
 // SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
 // text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
@@ -675,6 +679,25 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
   return { content, usage: json.usage, stop_reason: json.stop_reason, jotted };
 }
 
+// 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
+// 2回とも空なら最後の結果をそのまま返し、空応答のエラー表示は呼び出し側の既存判定に任せる。
+// 通常会話の送信には使わないこと（そちらはエラー表示→ユーザーが再送）。
+async function callModelRetryOnEmpty(args, onJotted) {
+  let json;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      json = await callModelWithContinuation(args);
+    } catch (e) {
+      if (e.jotted && onJotted) onJotted(e.jotted);
+      throw e;
+    }
+    if (json.jotted.length > 0 && onJotted) onJotted(json.jotted);
+    if (hasVisibleText(json.content)) return json;
+    console.warn(`[書斎] 空応答（${attempt}回目）stop_reason`, json.stop_reason, json.usage);
+  }
+  return json;
+}
+
 // 通常送信と「記憶を綴じる」で共用するリクエストボディ。
 // tools・system・履歴をここ一か所で組み立てることで、両者のキャッシュのプレフィックスを一致させる。
 // 綴じる用に別実装を書かないこと。
@@ -695,10 +718,10 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   if (room.jotNote) toolList.push(JOT_TOOL);
   const tools = toolList.length > 0 ? toolList : undefined;
   // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
-  // 署名の無い thinking ブロック（旧ストリーミング処理が壊して保存したもの）は再送できないので外す
+  // 履歴の thinking / redacted_thinking は送らない（この改修より前に保存された発言にも残っているため、送信時にも落とす）
   const sendable = messagesToSend
     .filter((m) => m.role !== "assistant" || hasVisibleText(m.content))
-    .map((m) => (m.role === "assistant" && Array.isArray(m.content) ? { ...m, content: sanitizeThinkingBlocks(m.content) } : m));
+    .map((m) => (m.role === "assistant" && Array.isArray(m.content) ? { ...m, content: stripThinkingBlocks(m.content) } : m));
   const payloadMessages = sendable.map((m, i) => {
     if (i !== sendable.length - 1) {
       return { role: m.role, content: m.content };
@@ -727,9 +750,9 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   return body;
 }
 
-// 再送できない thinking ブロック（署名が空・本文フィールドが無い）を取り除く。正常なブロックはそのまま返す
-function sanitizeThinkingBlocks(content) {
-  return content.filter((b) => b.type !== "thinking" || (typeof b.signature === "string" && b.signature !== "" && typeof b.thinking === "string"));
+// 履歴から thinking / redacted_thinking ブロックを取り除く
+function stripThinkingBlocks(content) {
+  return content.filter((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
 }
 
 function buildBlock2(room, memories, retrospects, notes, frozenDate) {
@@ -1303,10 +1326,14 @@ function ConversationScreen({
         throw new ShosaiError(message, { raw: JSON.stringify({ stop_reason: json.stop_reason, usage: json.usage }, null, 2) });
       }
 
-      // クライアントツールの tool_use ブロックは保存しない（直後に tool_result が無い形で再送するとAPIに弾かれるため）。
+      // 保存しないブロック：
+      // ・クライアントツールの tool_use（直後に tool_result が無い形で再送するとAPIに弾かれるため）
+      // ・thinking / redacted_thinking（前段の system・tools・履歴と紐づけて検証される。栞は block2 が綴じや書き付けで
+      //   変わるため、残して再送すると不定期に400になる。記憶は記録帳・回想録・手控えが担う）
+      // 継続ループ内（同一ターン）では無加工のまま積み直しているので、ここで落とすのは最終保存時のみ。
       // server_tool_use / web_search_tool_result は assistant content 内で完結するのでそのまま残す。
       const assistantMessage = {
-        role: "assistant", content: json.content.filter((b) => b.type !== "tool_use"),
+        role: "assistant", content: json.content.filter((b) => !UNSAVED_BLOCK_TYPES.has(b.type)),
         ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
       if (json.jotted.length > 0) assistantMessage.jotted = json.jotted;
@@ -1968,7 +1995,7 @@ function App() {
               extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
             },
           );
-          const json = await callModelWithContinuation({ building, apiKey, body });
+          const json = await callModelRetryOnEmpty({ building, apiKey, body });
           console.log("[書斎] weave usage", json.usage);
           const text = extractPlainText(json.content).trim();
           if (!text) {
@@ -2014,15 +2041,8 @@ function App() {
               extraMessages: [{ role: "user", content: BUNDLE_INSTRUCTION }],
             },
           );
-          let json;
-          try {
-            json = await callModelWithContinuation({ building, apiKey, body });
-          } catch (e) {
-            if (e.jotted) addNotes(room.id, e.jotted);
-            throw e;
-          }
-          // tool_choice: none なので通常は呼ばれないが、万一書き付けられたら手控えとして残す
-          if (json.jotted.length > 0) addNotes(room.id, json.jotted);
+          // tool_choice: none なので通常は書き付けられないが、万一書き付けられたら手控えとして残す
+          const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
           console.log("[書斎] bundle usage", json.usage);
           const text = extractPlainText(json.content).trim();
           if (!text) {
