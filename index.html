@@ -328,14 +328,16 @@ const WEAVE_MIN_OLD = 5; // 直近を除いた未編み記録がこの件数に�
 // 本文を書く余地を残せるよう大きめに取る（課金は実際に使った分だけ）
 const BUNDLE_MAX_TOKENS = 4096;
 const RETROSPECT_MAX_TOKENS = 4096;
-const CONTINUATION_MAX_ROUNDS = 6; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
+const CONTINUATION_MAX_ROUNDS = 8; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
+const TOOL_LOOP_MAX = 5; // うち tool_use（クライアントツール）で続きを生成させる回数の上限。超えたら打ち切ってエラー表示
 const JOT_NOTE_MAX_CHARS = 120;
 const JOT_TOOL = {
   name: "jot_note",
   description:
     "会話の途中で「これは残しておきたい」と思った事実・約束・好み・出来事を、その場で手控え帖に書き付ける。" +
     "書き付けた内容は次回以降の会話で【手控え】としてあなたの手元に戻ってくる。回想録に溶けず、消されるまで残り続ける。" +
-    "本当に残したいことだけを、1件につき120字以内で簡潔に。会話の返事は通常どおり続けること。",
+    "本当に残したいことだけを、1件につき120字以内で簡潔に。会話の返事は通常どおり続けること。" +
+    "残したいことがあれば必ずこのツールで書き付けること。ツールの呼び出しを本文にテキストで書かないこと。",
   input_schema: {
     type: "object",
     properties: {
@@ -517,6 +519,153 @@ function normalizeJotText(text) {
   return chars.slice(0, JOT_NOTE_MAX_CHARS).join("");
 }
 
+/* ----- テキスト化された jot_note 呼び出しの回収 -----
+   本物の tool_use ではなく、呼び出しの「形」を本文に書いてしまったもの（<invoke name="jot_note"> … </invoke>）を拾う。
+   名前空間付きのタグ名（<xx:invoke>）や <function_calls> の囲み、閉じタグ欠け（途中で切れた応答）も拾う。 */
+const TAG_NS = "(?:[A-Za-z_][\\w.-]*:)?";
+const TEXT_JOT_INVOKE_RE = new RegExp(
+  `<${TAG_NS}invoke\\s+name\\s*=\\s*["']jot_note["']\\s*>([\\s\\S]*?)(?:<\\/${TAG_NS}invoke\\s*>|$)`, "g");
+const TEXT_JOT_PARAM_RE = new RegExp(
+  `<${TAG_NS}parameter\\s+name\\s*=\\s*["']text["']\\s*>([\\s\\S]*?)(?:<\\/${TAG_NS}parameter\\s*>|$)`);
+const FUNCTION_CALLS_TAG_RE = new RegExp(`<\\/?${TAG_NS}function_calls\\s*>`, "g");
+// 「jot_note」だけの行（前後の ` や * の装飾も含む）
+const JOT_ONLY_LINE_RE = /^[ \t]*[`*_]*jot_note[`*_]*[ \t]*$/gm;
+
+// 文字列から呼び出しの形を取り除き、書き付けの中身を返す。
+// 返り値 { text, jotted, removed }。removed は取り除いた箇所の数（invoke と jot_note 単独行の合計）。
+function extractTextualJotCalls(text) {
+  if (typeof text !== "string" || !text.includes("jot_note")) return { text, jotted: [], removed: 0 };
+  const jotted = [];
+  let removed = 0;
+  let out = text.replace(TEXT_JOT_INVOKE_RE, (_, inner) => {
+    removed++;
+    const m = inner.match(TEXT_JOT_PARAM_RE);
+    const jot = normalizeJotText(m ? m[1] : "");
+    if (jot) jotted.push(jot);
+    return "";
+  });
+  out = out.replace(JOT_ONLY_LINE_RE, () => { removed++; return ""; });
+  if (removed === 0) return { text, jotted, removed };
+  out = out.replace(FUNCTION_CALLS_TAG_RE, "").replace(/\n[ \t]*(?=\n)/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text: out, jotted, removed };
+}
+
+// assistant の content（文字列 or ブロック配列）からテキスト化された呼び出しを取り除く。
+// text ブロックが空になったら落とす。返り値 { content, jotted, removed }。
+function stripTextualJotCalls(content) {
+  if (typeof content === "string") {
+    const r = extractTextualJotCalls(content);
+    return { content: r.text, jotted: r.jotted, removed: r.removed };
+  }
+  if (!Array.isArray(content)) return { content, jotted: [], removed: 0 };
+  const jotted = [];
+  let removed = 0;
+  const out = [];
+  content.forEach((b) => {
+    if (b.type !== "text") { out.push(b); return; }
+    const r = extractTextualJotCalls(b.text);
+    if (r.removed === 0) { out.push(b); return; }
+    removed += r.removed;
+    jotted.push(...r.jotted);
+    if (r.text !== "") out.push({ ...b, text: r.text });
+  });
+  return { content: removed > 0 ? out : content, jotted, removed };
+}
+
+// 完了したターンの assistant content を、履歴に保存する形に整える。
+// ・tool_use（クライアントツール）と thinking / redacted_thinking を落とす（理由は sendToModel の保存箇所を参照）
+// ・tool_use を挟んで分かれた前後の本文は、1つの text ブロックに結合する（引用付きのブロックは結合しない）
+// ・テキスト化された jot_note 呼び出しを取り除き、中身を jotted として返す
+// 継続ループの途中（同一ターン内）では使わないこと。thinking を落とすとAPIエラーになる。
+function finalizeAssistantContent(content) {
+  const merged = [];
+  let atBoundary = false;
+  (content || []).forEach((b) => {
+    if (b.type === "tool_use") { atBoundary = true; return; }
+    if (UNSAVED_BLOCK_TYPES.has(b.type)) return;
+    if (b.type === "text" && b.text === "") return;
+    const prev = merged[merged.length - 1];
+    if (atBoundary && b.type === "text" && !(b.citations && b.citations.length)
+      && prev && prev.type === "text" && !(prev.citations && prev.citations.length)) {
+      merged[merged.length - 1] = { ...prev, text: `${prev.text.replace(/\s+$/, "")}\n\n${b.text.replace(/^\s+/, "")}` };
+    } else {
+      merged.push({ ...b });
+    }
+    atBoundary = false;
+  });
+  return stripTextualJotCalls(merged);
+}
+
+// 一度きりの掃除：全部屋の履歴・記録帳・回想録からテキスト化された呼び出しを除去し、中身を手控えとして救出する計画を立てる。
+// data は { rooms, threads, memories, retrospects, notes }。データは書き換えず、適用後の値と集計を返す。
+function planTextualJotCleanup({ rooms, threads, memories, retrospects, notes }) {
+  const roomName = (id) => (rooms.find((r) => r.id === id) || {}).name || "（不明な部屋）";
+  const perRoom = {}; // roomId → 除去箇所数
+  const known = {}; // roomId → 既にある手控え本文の Set
+  notes.forEach((n) => { (known[n.roomId] = known[n.roomId] || new Set()).add(n.text); });
+  const rescued = [];
+  let skippedDup = 0;
+  const summary = { messages: 0, droppedMessages: 0, memories: 0, retrospects: 0, rescued: 0, skippedDup: 0 };
+
+  function rescue(roomId, texts, createdAt) {
+    texts.forEach((text) => {
+      const set = (known[roomId] = known[roomId] || new Set());
+      if (set.has(text)) { skippedDup++; return; }
+      set.add(text);
+      rescued.push({ id: uid(), roomId, text, createdAt: createdAt || nowISO() });
+    });
+  }
+
+  const nextThreads = threads.map((t) => {
+    let changed = false;
+    const messages = [];
+    (t.messages || []).forEach((m) => {
+      if (m.role !== "assistant") { messages.push(m); return; }
+      const r = stripTextualJotCalls(m.content);
+      if (r.removed === 0) { messages.push(m); return; }
+      changed = true;
+      summary.messages++;
+      perRoom[t.roomId] = (perRoom[t.roomId] || 0) + r.removed;
+      rescue(t.roomId, r.jotted, m.ts);
+      if (hasVisibleText(r.content)) messages.push({ ...m, content: r.content });
+      else summary.droppedMessages++; // 本文が呼び出しだけだった発言は消す（空の assistant は送信時にも落とされる）
+    });
+    return changed ? { ...t, messages } : t;
+  });
+
+  const nextMemories = memories.map((m) => {
+    const r = extractTextualJotCalls(m.text);
+    if (r.removed === 0) return m;
+    summary.memories++;
+    perRoom[m.roomId] = (perRoom[m.roomId] || 0) + r.removed;
+    rescue(m.roomId, r.jotted, m.createdAt);
+    return { ...m, text: r.text };
+  });
+
+  const nextRetrospects = { ...retrospects };
+  Object.entries(retrospects || {}).forEach(([roomId, rs]) => {
+    const r = extractTextualJotCalls(rs && rs.text);
+    if (r.removed === 0) return;
+    summary.retrospects++;
+    perRoom[roomId] = (perRoom[roomId] || 0) + r.removed;
+    rescue(roomId, r.jotted, rs.updatedAt);
+    nextRetrospects[roomId] = { ...rs, text: r.text };
+  });
+
+  summary.rescued = rescued.length;
+  summary.skippedDup = skippedDup;
+  summary.rooms = Object.entries(perRoom).map(([id, count]) => ({ name: roomName(id), count }));
+  summary.total = Object.values(perRoom).reduce((a, b) => a + b, 0);
+  // 部屋のシステムプロンプトに呼び出し書式の例が書かれていないか（自動では直さず、名前だけ知らせる）
+  summary.promptRooms = rooms
+    .filter((r) => typeof r.systemPrompt === "string" && /<[\w.:-]*invoke\b|<[\w.:-]*function_calls\b/.test(r.systemPrompt))
+    .map((r) => r.name);
+  return {
+    summary,
+    next: { threads: nextThreads, memories: nextMemories, retrospects: nextRetrospects, notes: [...notes, ...rescued] },
+  };
+}
+
 function buildThreadText(building, room, thread) {
   const parts = [`栞 ─ ${building.name} / ${room.name}\n${thread.title}（${thread.frozenDate}）`];
   thread.messages.forEach((m) => {
@@ -579,6 +728,8 @@ const STREAM_BROKEN_MESSAGE = "途中で筆が止まった。もう一度送っ�
 const TOOL_USE_BLOCK_TYPES = new Set(["tool_use", "server_tool_use", "mcp_tool_use"]);
 // thread.messages に保存しない assistant ブロックの種類（理由は sendToModel の保存箇所を参照）
 const UNSAVED_BLOCK_TYPES = new Set(["tool_use", "thinking", "redacted_thinking"]);
+// ストリーミングで入力JSONが壊れていた tool_use ブロック（API に送り返すブロックに印を付けないため WeakSet で持つ）
+const BROKEN_TOOL_INPUTS = new WeakSet();
 
 // SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
 // text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
@@ -626,8 +777,16 @@ async function readAnthropicStream(res, onDelta) {
         const block = content[data.index];
         if (block && TOOL_USE_BLOCK_TYPES.has(block.type)) {
           const raw = partialJson[data.index] || "";
-          if (raw !== "") block.input = JSON.parse(raw);
-          else if (!block.input) block.input = {};
+          if (raw !== "") {
+            try {
+              block.input = JSON.parse(raw);
+            } catch (e) {
+              // 入力が壊れていてもストリーム全体は止めず、tool_result で is_error を返す
+              console.warn("[書斎] tool_use の入力JSONを読めなかった", raw);
+              block.input = {};
+              BROKEN_TOOL_INPUTS.add(block);
+            }
+          } else if (!block.input) block.input = {};
         }
         break;
       }
@@ -724,59 +883,88 @@ async function callModel({ building, apiKey, body, onDelta }) {
   }
 }
 
-// 応答を最後まで受け取るための継続ループ。
+// クライアントツールを1つ実行し、tool_result ブロックを返す。jot_note の本文は jotted に積む。
+function runClientTool(block, jotted) {
+  const result = (content, isError) => (isError
+    ? { type: "tool_result", tool_use_id: block.id, content, is_error: true }
+    : { type: "tool_result", tool_use_id: block.id, content });
+  if (block.name !== JOT_TOOL.name) return result(`${block.name} というツールはこの部屋にない。`, true);
+  if (BROKEN_TOOL_INPUTS.has(block)) return result("入力のJSONを読めなかったため、保存できなかった。", true);
+  const text = normalizeJotText(block.input && block.input.text);
+  if (!text) return result("書き付ける内容（text）が空だったため、保存できなかった。", true);
+  jotted.push(text);
+  return result("保存しました", false);
+}
+
+// 応答を最後まで受け取るための継続ループ。通常送信・編集＆再送信・綴じ・編みの全経路がここを通る。
 // ・pause_turn（検索の途中で一時返却）なら、返ってきた content を assistant として足して同じボディで再送する。
-// ・tool_use（クライアントツール呼び出し）なら、jot_note の本文を jotted に積み、
-//   assistant（そのままの content）と user（全 tool_use_id への tool_result）を足して再送する。
+// ・tool_use（クライアントツール呼び出し）なら、全 tool_use を実行して jot_note の本文を jotted に積み、
+//   assistant（thinking を含むそのままの content）と user（全 tool_use_id への tool_result を1つにまとめたもの）を足して再送する。
+//   tool_use での継続は TOOL_LOOP_MAX 回まで。超えたら打ち切り、truncated: true を返す（呼び出し側でエラー表示）。
 // 全周回の content を順に連結して返す。usage・stop_reason は最終周のもの。jotted はこの送信中に書き付けられた本文の配列。
 // 途中でエラーになった場合も、それまでの jotted を error.jotted に載せて投げ直す（記憶は記憶として残すため）。
-// onDelta（任意）は各周回にそのまま渡す。継続周回でも同じ流れとして文字が増えていく。
+// onDelta（任意）は各周回にそのまま渡す。tool_use を挟んだ続きは空行を1つ挟んで同じ流れとして文字が増えていく。
 async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
   const content = [];
   const jotted = [];
   let json;
+  let toolRounds = 0;
+  let truncated = false;
+  let wroteText = false;
+  let needSep = false;
+  const delta = typeof onDelta === "function"
+    ? (t) => {
+      if (!t) return;
+      if (needSep && wroteText) onDelta("\n\n");
+      needSep = false;
+      wroteText = true;
+      onDelta(t);
+    }
+    : undefined;
   try {
-    for (let round = 1; round <= CONTINUATION_MAX_ROUNDS; round++) {
-      json = await callModel({ building, apiKey, body, onDelta });
+    for (let round = 1; ; round++) {
+      json = await callModel({ building, apiKey, body, onDelta: delta });
       console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
       const roundContent = json.content || [];
       content.push(...roundContent);
+      // 再送用：空の text ブロックはAPIに弾かれるので落とす。thinking 等はそのまま（除去するとAPIエラー）
+      const resendContent = roundContent.filter((b) => !(b.type === "text" && !b.text));
 
       let followUp;
       if (json.stop_reason === "pause_turn") {
-        followUp = [{ role: "assistant", content: roundContent }];
+        followUp = [{ role: "assistant", content: resendContent }];
       } else if (json.stop_reason === "tool_use") {
         // 1周に複数の tool_use があり得る。全 tool_use_id に tool_result を返すこと（欠けるとAPIエラー）
-        const toolResults = roundContent
-          .filter((b) => b.type === "tool_use")
-          .map((b) => {
-            if (b.name === JOT_TOOL.name) {
-              const text = normalizeJotText(b.input && b.input.text);
-              if (text) jotted.push(text);
-              return { type: "tool_result", tool_use_id: b.id, content: "書き付けた。" };
-            }
-            return { type: "tool_result", tool_use_id: b.id, content: "このツールは使えない。" };
-          });
-        if (toolResults.length === 0) break; // tool_use ブロックが無い tool_use 停止は継続しようがない
+        const uses = roundContent.filter((b) => b.type === "tool_use");
+        if (uses.length === 0) break; // tool_use ブロックが無い tool_use 停止は継続しようがない
+        const toolResults = uses.map((b) => runClientTool(b, jotted));
+        toolRounds++;
+        if (toolRounds > TOOL_LOOP_MAX) {
+          console.warn(`[書斎] tool_use の継続が上限（${TOOL_LOOP_MAX}回）に達したため打ち切り`);
+          truncated = true;
+          break;
+        }
         followUp = [
-          { role: "assistant", content: roundContent },
+          { role: "assistant", content: resendContent },
           { role: "user", content: toolResults },
         ];
       } else {
         break;
       }
 
-      if (round === CONTINUATION_MAX_ROUNDS) {
+      if (round >= CONTINUATION_MAX_ROUNDS) {
         console.warn(`[書斎] ${json.stop_reason} の継続が上限に達したため打ち切り`);
+        truncated = true;
         break;
       }
+      needSep = json.stop_reason === "tool_use";
       body = { ...body, messages: [...body.messages, ...followUp] };
     }
   } catch (e) {
     if (jotted.length > 0) e.jotted = jotted;
     throw e;
   }
-  return { content, usage: json.usage, stop_reason: json.stop_reason, jotted };
+  return { content, usage: json.usage, stop_reason: json.stop_reason, jotted, truncated };
 }
 
 // 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
@@ -801,7 +989,7 @@ async function callModelRetryOnEmpty(args, onJotted) {
       throw e;
     }
     if (json.jotted.length > 0 && onJotted) onJotted(json.jotted);
-    if (hasVisibleText(json.content)) return json;
+    if (hasVisibleText(finalizeAssistantContent(json.content).content)) return json;
     console.warn(`[書斎] 空応答（${attempt}回目）stop_reason`, json.stop_reason, json.usage);
   }
   return json;
@@ -828,11 +1016,16 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   if (room.webSearch) toolList.push({ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES });
   if (room.jotNote) toolList.push(JOT_TOOL);
   const tools = toolList.length > 0 ? toolList : undefined;
-  // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
   // 履歴の thinking / redacted_thinking は送らない（この改修より前に保存された発言にも残っているため、送信時にも落とす）
+  // 履歴に残ったテキスト化された jot_note 呼び出しも送らない（モデルが真似をして、本物のツール呼び出しをしなくなるため）
+  // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
   const sendable = messagesToSend
-    .filter((m) => m.role !== "assistant" || hasVisibleText(m.content))
-    .map((m) => (m.role === "assistant" && Array.isArray(m.content) ? { ...m, content: stripThinkingBlocks(m.content) } : m));
+    .map((m) => {
+      if (m.role !== "assistant") return m;
+      const content = Array.isArray(m.content) ? stripThinkingBlocks(m.content) : m.content;
+      return { ...m, content: stripTextualJotCalls(content).content };
+    })
+    .filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
   const payloadMessages = sendable.map((m, i) => {
     if (i !== sendable.length - 1) {
       return { role: m.role, content: m.content };
@@ -875,11 +1068,11 @@ function buildBlock2(room, memories, retrospects, notes, frozenDate) {
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   const memoryText =
     unwoven.length > 0
-      ? unwoven.map((m) => `・${m.text}`).join("\n")
+      ? unwoven.map((m) => `・${extractTextualJotCalls(m.text).text}`).join("\n")
       : retrospect
         ? "直近の記録はまだない。"
         : "まだ記録はない。今日が最初の日ということ。";
-  const retrospectText = retrospect ? `【回想録 ─ 遠い記憶】\n${retrospect.text}\n\n` : "";
+  const retrospectText = retrospect ? `【回想録 ─ 遠い記憶】\n${extractTextualJotCalls(retrospect.text).text}\n\n` : "";
   // 手控え（会話中にモデル本人が書き付けたもの）。回想録には編まれず、消されるまで残る。0件ならセクションごと出さない。
   const roomNotes = (notes || [])
     .filter((n) => n.roomId === room.id)
@@ -1426,32 +1619,44 @@ function ConversationScreen({
         if (e.jotted) onAddNotes(e.jotted);
         throw e;
       }
+      // 保存する形に整える（finalizeAssistantContent）。保存しないブロック：
+      // ・クライアントツールの tool_use と、ループ中に返した tool_result（呼び出しが履歴に残るとモデルが真似をする。
+      //   また手控えをOFFにした部屋で tools 未定義エラーになる）。前後の本文は1つに結合する。
+      //   書き付けた内容は次回以降【手控え】として注入されるので、履歴に残さなくてよい。
+      // ・thinking / redacted_thinking（前段の system・tools・履歴と紐づけて検証される。栞は block2 が綴じや書き付けで
+      //   変わるため、残して再送すると不定期に400になる。記憶は記録帳・回想録・手控えが担う）
+      // ・テキスト化された jot_note 呼び出し（保険。中身は手控えとして回収する。手控えOFFの部屋では除去だけ）
+      // 継続ループ内（同一ターン）では無加工のまま積み直しているので、ここで落とすのは最終保存時のみ。
+      // server_tool_use / web_search_tool_result は assistant content 内で完結するのでそのまま残す。
+      const finalized = finalizeAssistantContent(json.content);
+      const jotted = [...json.jotted, ...(room.jotNote ? finalized.jotted : [])];
+      if (finalized.removed > 0) console.warn("[書斎] テキスト化された jot_note 呼び出しを回収", finalized.jotted);
+
       // 手控えは応答の成否（空応答・refusal を含む）に関わらず保存する
-      if (json.jotted.length > 0) onAddNotes(json.jotted);
+      if (jotted.length > 0) onAddNotes(jotted);
 
       // 空応答は保存しない。送ったユーザー発言は残すので、編集＆再送信でやり直せる。
-      if (!hasVisibleText(json.content)) {
+      if (!hasVisibleText(finalized.content)) {
         console.warn("[書斎] 空応答 stop_reason", json.stop_reason, json.usage);
         const message = json.stop_reason === "refusal"
           ? "この話題には筆を執れなかったようだ。言い回しを変えて、もう一度試してみてほしい。"
-          : `返事が綴られなかった（${json.stop_reason}）。もう一度送ってみてほしい。`;
+          : jotted.length > 0
+            ? "手控えは書き付けたが、返事の本文が空だった。もう一度送ってみてほしい。"
+            : `返事が綴られなかった（${json.stop_reason}）。もう一度送ってみてほしい。`;
         throw new ShosaiError(message, { raw: emptyResponseDetail(json) });
       }
 
-      // 保存しないブロック：
-      // ・クライアントツールの tool_use（直後に tool_result が無い形で再送するとAPIに弾かれるため）
-      // ・thinking / redacted_thinking（前段の system・tools・履歴と紐づけて検証される。栞は block2 が綴じや書き付けで
-      //   変わるため、残して再送すると不定期に400になる。記憶は記録帳・回想録・手控えが担う）
-      // 継続ループ内（同一ターン）では無加工のまま積み直しているので、ここで落とすのは最終保存時のみ。
-      // server_tool_use / web_search_tool_result は assistant content 内で完結するのでそのまま残す。
       const assistantMessage = {
-        role: "assistant", content: json.content.filter((b) => !UNSAVED_BLOCK_TYPES.has(b.type)),
+        role: "assistant", content: finalized.content,
         ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
-      if (json.jotted.length > 0) assistantMessage.jotted = json.jotted;
+      if (jotted.length > 0) assistantMessage.jotted = jotted;
       jumpPendingRef.current = true;
       streamedTsRef.current = assistantMessage.ts;
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
+      if (json.truncated) {
+        setError(new ShosaiError(`ツールの呼び出しが続きすぎたので、途中で打ち切った（上限${TOOL_LOOP_MAX}回）。ここまでの返事と手控えは残してある。`));
+      }
     } catch (e) {
       setError(e);
     } finally {
@@ -1812,7 +2017,11 @@ function MemoriesScreen({
 
 /* ===== 設定画面 ===== */
 
-function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup }) {
+function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup, onScanJotCleanup, onRunJotCleanup }) {
+  const [cleanupScan, setCleanupScan] = useState(null); // 調べた結果（summary）
+  const [cleanupResult, setCleanupResult] = useState(null); // 掃除した結果（summary）
+  const [confirmCleanup, setConfirmCleanup] = useState(false);
+  const [cleanupError, setCleanupError] = useState(null);
   const [editingKey, setEditingKey] = useState(false);
   const [keyValue, setKeyValue] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
@@ -1895,6 +2104,43 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
       </div>
 
       <div className="settings-block">
+        <h2>書き付けの掃除</h2>
+        <div className="kv-row">
+          <span>会話・記録帳・回想録に文字のまま残った手控えの呼び出しを取り除き、中身を手控えに救出する</span>
+          <button style={{ flexShrink: 0 }} onClick={() => { setCleanupResult(null); setCleanupError(null); setCleanupScan(onScanJotCleanup()); }}>調べる</button>
+        </div>
+        {cleanupScan && !cleanupResult && (
+          <div className="kv-row" style={{ display: "block" }}>
+            {cleanupScan.total === 0 ? (
+              <div>残っている呼び出しは見つからなかった。</div>
+            ) : (
+              <>
+                <div>見つかった呼び出し：{cleanupScan.total}件（会話の発言 {cleanupScan.messages}件・記録帳 {cleanupScan.memories}件・回想録 {cleanupScan.retrospects}件）</div>
+                {cleanupScan.rooms.map((r, i) => <div key={i}>・{r.name}：{r.count}件</div>)}
+                <div>救出できる手控え：{cleanupScan.rescued}件{cleanupScan.skippedDup > 0 ? `（同じ手控えが既にあるもの ${cleanupScan.skippedDup}件は保存しない）` : ""}</div>
+                <div className="modal-actions">
+                  <button className="accent" onClick={() => setConfirmCleanup(true)}>掃除する</button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {cleanupResult && (
+          <div className="kv-row" style={{ display: "block" }}>
+            <div>掃除した。呼び出しを {cleanupResult.total}件 取り除き、手控えを {cleanupResult.rescued}件 救出した。</div>
+            {cleanupResult.droppedMessages > 0 && <div>（本文が呼び出しだけだった発言 {cleanupResult.droppedMessages}件は消した）</div>}
+            {cleanupResult.skippedDup > 0 && <div>（同じ手控えが既にあったもの {cleanupResult.skippedDup}件は保存しなかった）</div>}
+          </div>
+        )}
+        {(cleanupScan || cleanupResult) && (cleanupResult || cleanupScan).promptRooms.length > 0 && (
+          <div className="kv-row" style={{ display: "block" }}>
+            部屋のシステムプロンプトに呼び出し書式の例が書かれている：{(cleanupResult || cleanupScan).promptRooms.join("、")}。モデルが真似をするので、部屋の設定から消しておくとよい。
+          </div>
+        )}
+        <ErrorBox error={cleanupError} />
+      </div>
+
+      <div className="settings-block">
         <h2>データ全消去</h2>
         <div className="kv-row">
           <span>棟・部屋・スレッド・記録をすべて消す</span>
@@ -1918,6 +2164,24 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
           requireDouble
           onCancel={() => setConfirmWipe(false)}
           onConfirm={() => { onWipeAll(); setConfirmWipe(false); }}
+        />
+      )}
+
+      {confirmCleanup && (
+        <ConfirmDialog
+          title="書き付けを掃除する"
+          message="先に全データのバックアップを書き出してから、見つかった呼び出しを取り除き、中身を手控えに救出する。よい？"
+          confirmLabel="掃除する"
+          onCancel={() => setConfirmCleanup(false)}
+          onConfirm={() => {
+            setConfirmCleanup(false);
+            try {
+              setCleanupResult(onRunJotCleanup());
+              setCleanupScan(null);
+            } catch (e) {
+              setCleanupError(new ShosaiError("掃除できなかった。データは変えていない。", { raw: String(e) }));
+            }
+          }}
         />
       )}
 
@@ -2015,6 +2279,12 @@ function App() {
   function setMemories(next) { setMemoriesState(next); saveJSON(K.memories, next); }
   function setRetrospects(next) { setRetrospectsState(next); saveJSON(K.retrospects, next); }
   function setNotes(next) { setNotesState(next); saveJSON(K.notes, next); }
+  // 全データのバックアップを書き出す。APIキー・テーマ・lastThreadId は含めない
+  function exportBackup(suffix) {
+    const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []) };
+    const name = suffix ? `shiori_backup_${todayYMD()}_${suffix}.json` : `shiori_backup_${todayYMD()}.json`;
+    downloadFile(name, JSON.stringify(data, null, 2), "application/json");
+  }
   // 手控えの追記。送信は非同期で終わるため、レンダー時点の notes ではなく保存済みの最新から足す。
   function addNotes(roomId, texts) {
     const ts = nowISO();
@@ -2050,10 +2320,17 @@ function App() {
           Object.values(K).forEach((k) => localStorage.removeItem(k));
           window.location.reload();
         }}
-        onExportBackup={() => {
-          // APIキー・テーマ・lastThreadId は含めない
-          const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes };
-          downloadFile(`shiori_backup_${todayYMD()}.json`, JSON.stringify(data, null, 2), "application/json");
+        onExportBackup={() => exportBackup()}
+        onScanJotCleanup={() => planTextualJotCleanup({ rooms, threads, memories, retrospects, notes }).summary}
+        onRunJotCleanup={() => {
+          // 実行前に必ず全データのバックアップを書き出す。失敗したら掃除しない
+          exportBackup("before_cleanup");
+          const plan = planTextualJotCleanup({ rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []) });
+          setThreads(plan.next.threads);
+          setMemories(plan.next.memories);
+          setRetrospects(plan.next.retrospects);
+          setNotes(plan.next.notes);
+          return plan.summary;
         }}
         onRestoreBackup={(data) => {
           // 全置き換え。APIキーとテーマには触らない
@@ -2107,9 +2384,12 @@ function App() {
               extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
             },
           );
-          const json = await callModelRetryOnEmpty({ building, apiKey, body });
+          const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
           console.log("[書斎] weave usage", json.usage);
-          const text = extractPlainText(json.content).trim();
+          // 綴じと同じく、テキスト化された呼び出しは取り除き、中身は手控えとして回収する
+          const finalized = finalizeAssistantContent(json.content);
+          if (room.jotNote && finalized.jotted.length > 0) addNotes(room.id, finalized.jotted);
+          const text = extractPlainText(finalized.content).trim();
           if (!text) {
             console.warn("[書斎] 編み空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("回想録が編めなかった。もう一度試してみてほしい。", {
@@ -2157,7 +2437,11 @@ function App() {
           // tool_choice: none なので通常は書き付けられないが、万一書き付けられたら手控えとして残す
           const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
           console.log("[書斎] bundle usage", json.usage);
-          const text = extractPlainText(json.content).trim();
+          // tool_choice: none だと呼び出しを本文にテキストで書くことがある。記録帳に入ると毎回注入されて真似が広がるので、
+          // 必ず取り除き、中身は手控えとして回収する
+          const finalized = finalizeAssistantContent(json.content);
+          if (room.jotNote && finalized.jotted.length > 0) addNotes(room.id, finalized.jotted);
+          const text = extractPlainText(finalized.content).trim();
           if (!text) {
             console.warn("[書斎] 綴じ空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("記録が綴られなかった。もう一度試してみてほしい。", {
