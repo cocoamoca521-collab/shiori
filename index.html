@@ -11,7 +11,7 @@
 <meta name="theme-color" content="#EBDCD0">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@400;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #F5ECE4;
@@ -33,6 +33,9 @@
     --input-border: #E2CFC4;
     --error: #A65F5C;
     --overlay: rgba(91, 70, 65, 0.35);
+    --code-bg: #E9D9CC;
+    --code-inline-bg: #EEE1D6;
+    --quote-line: #D3A8AD;
   }
   :root[data-theme="dark"] {
     --bg: #2A2123;
@@ -54,6 +57,9 @@
     --input-border: #4A3A3E;
     --error: #D08A80;
     --overlay: rgba(0, 0, 0, 0.5);
+    --code-bg: #3B2F32;
+    --code-inline-bg: #382C2F;
+    --quote-line: #8E6A70;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -210,6 +216,40 @@
     overflow-wrap: anywhere;
   }
   .msg-loading { color: var(--muted); font-style: italic; }
+
+  /* 発言の時刻（自分＝右寄せ／モデル＝左寄せ。並びは各 .msg の flex に従う） */
+  .msg-time { color: var(--faint); font-size: 11px; line-height: 1.4; margin-top: 4px; font-family: "Zen Kaku Gothic New", sans-serif; letter-spacing: 0.04em; }
+  /* 日付の区切り線（中央に日付、左右に細い線） */
+  .date-sep { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; letter-spacing: 0.06em; }
+  .date-sep::before, .date-sep::after { content: ""; flex: 1; height: 1px; background: var(--crepe-cream); opacity: 0.7; }
+
+  /* モデル発言のマークダウン表示。本文の明朝・行間は .msg-model を継ぐ */
+  .md { white-space: normal; overflow-wrap: break-word; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 0.9em; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-weight: 700; line-height: 1.6; margin: 1.2em 0 0.5em; letter-spacing: 0.03em; }
+  .md h1 { font-size: 1.3em; }
+  .md h2 { font-size: 1.2em; }
+  .md h3 { font-size: 1.1em; }
+  .md h4, .md h5, .md h6 { font-size: 1em; }
+  .md strong { font-weight: 700; }
+  .md ul, .md ol { margin: 0 0 0.9em; padding-left: 1.6em; }
+  .md li { margin: 0.15em 0; }
+  .md li > ul, .md li > ol { margin: 0.15em 0 0.2em; }
+  .md li > p { margin: 0 0 0.4em; }
+  .md blockquote { margin: 0 0 0.9em; padding: 0 0 0 1em; border-left: 2px solid var(--quote-line); color: var(--ink-user); }
+  .md hr { border: none; border-top: 1px solid var(--crepe-cream); margin: 1.4em 0; }
+  .md code { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace; font-size: 0.85em; letter-spacing: 0; }
+  .md :not(pre) > code { background: var(--code-inline-bg); padding: 0.1em 0.4em; border-radius: 6px; }
+  .md pre { background: var(--code-bg); border-radius: 12px; padding: 12px 14px; margin: 0 0 0.9em; overflow-x: auto; white-space: pre; line-height: 1.6; -webkit-overflow-scrolling: touch; }
+  .md pre code { font-size: 13px; white-space: pre; overflow-wrap: normal; }
+  .md-table { overflow-x: auto; margin: 0 0 0.9em; -webkit-overflow-scrolling: touch; }
+  .md table { border-collapse: collapse; font-size: 0.92em; line-height: 1.7; overflow-wrap: normal; }
+  .md th, .md td { border: 1px solid var(--input-border); padding: 4px 10px; text-align: left; vertical-align: top; }
+  .md th { font-weight: 700; }
+  .md a { color: var(--accent-text); overflow-wrap: anywhere; }
+  .md del { color: var(--muted); }
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent-text); }
   .usage-line { color: var(--faint); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
@@ -302,6 +342,9 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- モデル発言のマークダウン表示（marked で HTML 化 → DOMPurify でサニタイズ）。読めなかった場合はプレーン表示に戻る -->
+<script src="https://unpkg.com/marked@12.0.2/marked.min.js" crossorigin></script>
+<script src="https://unpkg.com/dompurify@3.1.6/dist/purify.min.js" crossorigin></script>
 
 <script type="text/babel" data-type="module">
 const { useState, useEffect, useRef } = React;
@@ -440,6 +483,74 @@ function formatDateJP(iso) {
   const d = new Date(iso);
   return `${d.getMonth() + 1}月${d.getDate()}日`;
 }
+
+const WEEKDAYS_JP = ["日", "月", "火", "水", "木", "金", "土"];
+
+// 発言の時刻（端末のローカル時刻・24時間表記）。例: 21:24
+function formatTimeHM(iso) {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+// 日付の区切り線用。例: 11月17日（火）。今年でなければ 2025年11月17日（月）
+function formatDateSep(iso) {
+  const d = new Date(iso);
+  const year = d.getFullYear() === new Date().getFullYear() ? "" : `${d.getFullYear()}年`;
+  return `${year}${d.getMonth() + 1}月${d.getDate()}日（${WEEKDAYS_JP[d.getDay()]}）`;
+}
+
+// テキストログ用。例: [11/17 21:24]
+function formatLogStamp(iso) {
+  const d = new Date(iso);
+  return `[${d.getMonth() + 1}/${d.getDate()} ${formatTimeHM(iso)}]`;
+}
+
+// ローカル時刻での日付の同一判定用キー
+function localDayKey(iso) {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+// createdAt が読める時刻か（古いメッセージには無い。壊れた値も「時刻なし」扱い）
+function hasCreatedAt(m) {
+  return !!m && typeof m.createdAt === "string" && !isNaN(new Date(m.createdAt).getTime());
+}
+
+/* ----- マークダウン表示（モデルの発言だけ。表示専用で、保存・送信・ログの本文は生テキストのまま） ----- */
+
+// marked / DOMPurify が読み込めなかったときは null（呼び出し側でプレーン表示にする）
+const markdownRenderer = (() => {
+  if (typeof window.marked === "undefined" || !window.marked.Marked || typeof window.DOMPurify === "undefined") {
+    console.warn("[書斎] marked / DOMPurify を読み込めなかったため、モデルの発言はプレーン表示にする");
+    return null;
+  }
+  const md = new window.marked.Marked({ gfm: true, breaks: true });
+  md.use({
+    renderer: {
+      // 生のHTMLタグは反映させず、文字としてそのまま見せる
+      html(html) { return escapeHtml(typeof html === "string" ? html : (html && html.text) || ""); },
+      // 画像は読み込まず（外部への通信を起こさない）、リンクとして出す
+      image(href, title, text) {
+        const label = escapeHtml(text || href || "");
+        return href ? `<a href="${escapeHtml(href)}">${label}</a>` : label;
+      },
+    },
+  });
+  const purify = window.DOMPurify;
+  // リンクはすべて新しいタブで開く
+  purify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+  return (text) => {
+    const raw = md.parse(String(text || ""));
+    // 表だけ横スクロールできるよう囲む（生HTMLは上でエスケープ済みなので、ここに来る <table> は表記法由来のみ）
+    const wrapped = raw.replace(/<table>/g, '<div class="md-table"><table>').replace(/<\/table>/g, "</table></div>");
+    return purify.sanitize(wrapped, { ADD_ATTR: ["target"], FORBID_TAGS: ["style", "img", "form", "button", "iframe"] });
+  };
+})();
 
 function loadJSON(key, fallback) {
   try {
@@ -669,8 +780,10 @@ function planTextualJotCleanup({ rooms, threads, memories, retrospects, notes })
 function buildThreadText(building, room, thread) {
   const parts = [`栞 ─ ${building.name} / ${room.name}\n${thread.title}（${thread.frozenDate}）`];
   thread.messages.forEach((m) => {
+    // 時刻のある発言だけ頭に [11/17 21:24] を付ける（時刻のない古い発言は今までどおり）
+    const stamp = hasCreatedAt(m) ? `${formatLogStamp(m.createdAt)} ` : "";
     if (m.role === "user") {
-      parts.push(`【多恵子】\n${extractPlainText(m.content)}`);
+      parts.push(`${stamp}【多恵子】\n${extractPlainText(m.content)}`);
       return;
     }
     let body = extractPlainText(m.content);
@@ -678,7 +791,7 @@ function buildThreadText(building, room, thread) {
       ? m.content.filter((b) => b.type === "text").flatMap((b) => b.citations || [])
       : [];
     if (citations.length > 0) body += "\n" + citations.map((c) => `出典: ${c.url}`).join("\n");
-    parts.push(`【${room.name}】\n${body}`);
+    parts.push(`${stamp}【${room.name}】\n${body}`);
   });
   return parts.join("\n\n") + "\n";
 }
@@ -1488,9 +1601,18 @@ function ThreadsScreen({ building, room, threads, onBack, onOpenThread, onCreate
 
 /* ===== 会話画面 ===== */
 
-function MessageContent({ content }) {
+// マークダウンの本文。markdownRenderer が無い（ライブラリを読めなかった）ときはプレーン表示
+function MarkdownText({ text }) {
+  const html = React.useMemo(() => (markdownRenderer ? markdownRenderer(text) : null), [text]);
+  if (html === null) return <div>{text}</div>;
+  return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+// markdown: true はモデルの発言だけ。自分の発言はプレーンテキストのまま
+function MessageContent({ content, markdown = false }) {
+  const body = (text) => (markdown ? <MarkdownText text={text} /> : <div>{text}</div>);
   if (typeof content === "string") {
-    return <div>{content}</div>;
+    return body(content);
   }
   if (!Array.isArray(content)) return null;
   const textBlocks = content.filter((b) => b.type === "text");
@@ -1498,7 +1620,7 @@ function MessageContent({ content }) {
   const citations = textBlocks.flatMap((b) => b.citations || []);
   return (
     <div>
-      <div>{text}</div>
+      {body(text)}
       {citations.length > 0 && (
         <div className="citations">
           {citations.map((c, i) => (
@@ -1556,6 +1678,26 @@ function ConversationScreen({
   const jumpPendingRef = useRef(false); // 保存直後、その発言の頭へジャンプする
   const jumpedRef = useRef(false); // ジャンプ後、次の送信まで「最下部へ」を抑える
   const streamedTsRef = useRef(null); // ストリーミング表示から切り替わった発言（フェードインを省き、ちらつかせない）
+  const streamBufRef = useRef(""); // 届いた本文の全体。描画（マークダウン変換）は requestAnimationFrame で間引く
+  const streamRafRef = useRef(null);
+
+  function resetStream() {
+    if (streamRafRef.current !== null) cancelAnimationFrame(streamRafRef.current);
+    streamRafRef.current = null;
+    streamBufRef.current = "";
+    setStreamText("");
+  }
+
+  function appendStream(t) {
+    streamBufRef.current += t;
+    if (streamRafRef.current !== null) return;
+    streamRafRef.current = requestAnimationFrame(() => {
+      streamRafRef.current = null;
+      setStreamText(streamBufRef.current);
+    });
+  }
+
+  useEffect(() => () => { if (streamRafRef.current !== null) cancelAnimationFrame(streamRafRef.current); }, []);
 
   function scrollToBottom() {
     window.scrollTo({ top: document.documentElement.scrollHeight });
@@ -1603,7 +1745,7 @@ function ConversationScreen({
     jumpedRef.current = false;
     jumpPendingRef.current = false;
     followRef.current = true;
-    setStreamText("");
+    resetStream();
     onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
 
@@ -1612,7 +1754,7 @@ function ConversationScreen({
       let json;
       try {
         json = await callModelWithContinuation({
-          building, apiKey, body, onDelta: (t) => setStreamText((prev) => prev + t),
+          building, apiKey, body, onDelta: appendStream,
         });
       } catch (e) {
         // 途中で失敗しても、それまでに書き付けられた手控えは残す
@@ -1646,9 +1788,11 @@ function ConversationScreen({
         throw new ShosaiError(message, { raw: emptyResponseDetail(json) });
       }
 
+      // createdAt は応答が最終的に完了した時刻（継続ループ後）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）
+      const doneAt = nowISO();
       const assistantMessage = {
         role: "assistant", content: finalized.content,
-        ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
+        ts: doneAt, createdAt: doneAt, usage: json.usage, stopReason: json.stop_reason,
       };
       if (jotted.length > 0) assistantMessage.jotted = jotted;
       jumpPendingRef.current = true;
@@ -1660,7 +1804,7 @@ function ConversationScreen({
     } catch (e) {
       setError(e);
     } finally {
-      setStreamText("");
+      resetStream();
       setSending(false);
     }
   }
@@ -1669,7 +1813,8 @@ function ConversationScreen({
     const text = draft.trim();
     if (!text || sending) return;
     setDraft("");
-    const userMessage = { role: "user", content: text, ts: nowISO() };
+    const sentAt = nowISO();
+    const userMessage = { role: "user", content: text, ts: sentAt, createdAt: sentAt };
     sendToModel([...thread.messages, userMessage]);
   }
 
@@ -1699,7 +1844,9 @@ function ConversationScreen({
     const text = editText.trim();
     setConfirmResend(null);
     cancelEdit();
-    const userMessage = { role: "user", content: text, ts: nowISO() };
+    // 編集後の発言は再送信した時刻で作り直す
+    const sentAt = nowISO();
+    const userMessage = { role: "user", content: text, ts: sentAt, createdAt: sentAt };
     sendToModel([...thread.messages.slice(0, index), userMessage]);
   }
 
@@ -1759,10 +1906,20 @@ function ConversationScreen({
         {thread.messages.length === 0 && !sending && (
           <div className="empty-hint">まだ何もない。話しかけてみてほしい。</div>
         )}
-        {thread.messages.map((m, i) => (
+        {thread.messages.map((m, i) => {
+          // 日付の区切り：直前の「時刻つき」発言とローカル日付が違うとき（時刻つきの最初の発言の前にも）。時刻なしの発言は飛ばす
+          const timed = hasCreatedAt(m);
+          let showDateSep = false;
+          if (timed) {
+            let prev = null;
+            for (let j = i - 1; j >= 0; j--) { if (hasCreatedAt(thread.messages[j])) { prev = thread.messages[j]; break; } }
+            showDateSep = !prev || localDayKey(prev.createdAt) !== localDayKey(m.createdAt);
+          }
+          return (
+          <React.Fragment key={i}>
+          {showDateSep && <div className="date-sep">{formatDateSep(m.createdAt)}</div>}
           <div
             className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}${m.role === "user" && editingIndex === i ? " editing" : ""}`}
-            key={i}
             style={m.ts && m.ts === streamedTsRef.current ? { animation: "none" } : undefined}
             ref={m.role === "assistant" && i === thread.messages.length - 1 ? lastAssistantRef : undefined}
           >
@@ -1777,8 +1934,9 @@ function ConversationScreen({
             ) : m.role === "user" ? (
               <div className="bubble-user"><MessageContent content={m.content} /></div>
             ) : (
-              <MessageContent content={m.content} />
+              <MessageContent content={m.content} markdown />
             )}
+            {timed && !(m.role === "user" && editingIndex === i) && <div className="msg-time">{formatTimeHM(m.createdAt)}</div>}
             {m.role === "user" && editingIndex !== i && (
               <div className="msg-tools">
                 <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
@@ -1787,10 +1945,12 @@ function ConversationScreen({
             {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
             {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} />}
           </div>
-        ))}
+          </React.Fragment>
+          );
+        })}
         {sending && (
           streamText
-            ? <div className="msg msg-model">{streamText}</div>
+            ? <div className="msg msg-model"><MarkdownText text={streamText} /></div>
             : <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>
         )}
         {bundling && <div className="msg msg-loading">（記憶を綴じている）</div>}
