@@ -865,6 +865,49 @@ const UNSAVED_BLOCK_TYPES = new Set(["tool_use", "thinking", "redacted_thinking"
 // ストリーミングで入力JSONが壊れていた tool_use ブロック（API に送り返すブロックに印を付けないため WeakSet で持つ）
 const BROKEN_TOOL_INPUTS = new WeakSet();
 
+/* ----- usage の扱い ----- */
+
+// message_start の usage に message_delta の usage を重ねる。入れ子（cache_creation 等）も同じ規則で重ねる。
+// 後から来た null / undefined、および「前に値があるところへの 0」では上書きしない
+function mergeUsage(base, next) {
+  const out = { ...(base || {}) };
+  Object.entries(next || {}).forEach(([k, v]) => {
+    if (v === null || v === undefined) return;
+    if (typeof v === "object" && !Array.isArray(v)) {
+      out[k] = mergeUsage(out[k] && typeof out[k] === "object" ? out[k] : {}, v);
+      return;
+    }
+    if (v === 0 && typeof out[k] === "number" && out[k] !== 0) return;
+    out[k] = v;
+  });
+  return out;
+}
+
+// 継続ループ（tool_use・pause_turn）で複数回リクエストしたターンの usage を合計する。数値は足し、入れ子は再帰で足す。
+// 数値以外（service_tier 等の文字列）は後の値を採る
+function sumUsage(a, b) {
+  if (!a) return b ? { ...b } : a;
+  if (!b) return { ...a };
+  const out = { ...a };
+  Object.entries(b).forEach(([k, v]) => {
+    if (v === null || v === undefined) return;
+    if (typeof v === "number") out[k] = (typeof out[k] === "number" ? out[k] : 0) + v;
+    else if (typeof v === "object" && !Array.isArray(v)) out[k] = sumUsage(out[k] && typeof out[k] === "object" ? out[k] : null, v);
+    else out[k] = v;
+  });
+  return out;
+}
+
+// usage 表示の「書」（キャッシュ書き込み）。cache_creation_input_tokens を使い、
+// 無い（または 0 なのに内訳には値がある）場合は cache_creation の 5m と 1h の合計を使う
+function cacheWriteTokens(usage) {
+  if (!usage) return 0;
+  const total = typeof usage.cache_creation_input_tokens === "number" ? usage.cache_creation_input_tokens : 0;
+  const cc = usage.cache_creation && typeof usage.cache_creation === "object" ? usage.cache_creation : null;
+  const breakdown = cc ? (cc.ephemeral_5m_input_tokens || 0) + (cc.ephemeral_1h_input_tokens || 0) : 0;
+  return total > 0 ? total : breakdown;
+}
+
 // SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
 // text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
 async function readAnthropicStream(res, onDelta) {
@@ -877,7 +920,9 @@ async function readAnthropicStream(res, onDelta) {
   function handleEvent(data) {
     switch (data.type) {
       case "message_start":
-        usage = { ...((data.message && data.message.usage) || {}) };
+        // 調査用：届いた usage をそのまま出す（「書」がどのフィールドから来るかの確認）
+        console.log("[書斎] raw usage message_start", JSON.stringify((data.message && data.message.usage) || null));
+        usage = mergeUsage({}, (data.message && data.message.usage) || {});
         break;
       case "content_block_start": {
         const block = { ...data.content_block };
@@ -926,8 +971,9 @@ async function readAnthropicStream(res, onDelta) {
       }
       case "message_delta":
         if (data.delta && data.delta.stop_reason !== undefined) stopReason = data.delta.stop_reason;
-        // message_delta の usage（出力系・累積値）を message_start の入力系に重ねる。null は上書きしない
-        Object.entries(data.usage || {}).forEach(([k, v]) => { if (v !== null && v !== undefined) usage[k] = v; });
+        console.log("[書斎] raw usage message_delta", JSON.stringify(data.usage || null));
+        // message_delta の usage（出力系・累積値）を message_start の入力系に重ねる。null・undefined・後から来た 0 では上書きしない
+        usage = mergeUsage(usage, data.usage);
         break;
       case "message_stop":
         finished = true;
@@ -1002,7 +1048,9 @@ async function anthropicMessages({ apiKey, body, onDelta }) {
   const json = streaming ? await readAnthropicStream(res, onDelta) : await res.json().catch(() => null);
   if (!json) throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: "応答を読めなかった" });
   if (json.usage) {
-    console.log("[書斎] usage", json.usage);
+    // 非ストリーミング（綴じ・編み）は応答の usage をそのまま使う。調査用に生の値を出す
+    if (!streaming) console.log("[書斎] raw usage (non-stream)", JSON.stringify(json.usage));
+    console.log("[書斎] usage", json.usage, "書", cacheWriteTokens(json.usage));
   }
   return json;
 }
@@ -1035,13 +1083,14 @@ function runClientTool(block, jotted) {
 // ・tool_use（クライアントツール呼び出し）なら、全 tool_use を実行して jot_note の本文を jotted に積み、
 //   assistant（thinking を含むそのままの content）と user（全 tool_use_id への tool_result を1つにまとめたもの）を足して再送する。
 //   tool_use での継続は TOOL_LOOP_MAX 回まで。超えたら打ち切り、truncated: true を返す（呼び出し側でエラー表示）。
-// 全周回の content を順に連結して返す。usage・stop_reason は最終周のもの。jotted はこの送信中に書き付けられた本文の配列。
+// 全周回の content を順に連結して返す。usage は全周回の合計（sumUsage）、stop_reason は最終周のもの。jotted はこの送信中に書き付けられた本文の配列。
 // 途中でエラーになった場合も、それまでの jotted を error.jotted に載せて投げ直す（記憶は記憶として残すため）。
 // onDelta（任意）は各周回にそのまま渡す。tool_use を挟んだ続きは空行を1つ挟んで同じ流れとして文字が増えていく。
 async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
   const content = [];
   const jotted = [];
   let json;
+  let totalUsage = null;
   let toolRounds = 0;
   let truncated = false;
   let wroteText = false;
@@ -1059,6 +1108,8 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
     for (let round = 1; ; round++) {
       json = await callModel({ building, apiKey, body, onDelta: delta });
       console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
+      // 各周の「書」を先に確定させてから足す（周ごとに cache_creation_input_tokens の有無が違っても取りこぼさない）
+      if (json.usage) totalUsage = sumUsage(totalUsage, { ...json.usage, cache_creation_input_tokens: cacheWriteTokens(json.usage) });
       const roundContent = json.content || [];
       content.push(...roundContent);
       // 再送用：空の text ブロックはAPIに弾かれるので落とす。thinking 等はそのまま（除去するとAPIエラー）
@@ -1098,7 +1149,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
     if (jotted.length > 0) e.jotted = jotted;
     throw e;
   }
-  return { content, usage: json.usage, stop_reason: json.stop_reason, jotted, truncated };
+  return { content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated };
 }
 
 // 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
@@ -1659,7 +1710,7 @@ function UsageLine({ usage, stopReason }) {
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
   const read = usage.cache_read_input_tokens || 0;
-  const created = usage.cache_creation_input_tokens || 0;
+  const created = cacheWriteTokens(usage);
   const text = read > 0 || created > 0
     ? `栞 ─ 読 ${fmt(read)} ・ 書 ${fmt(created)} ・ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`
     : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
@@ -2568,7 +2619,7 @@ function App() {
             },
           );
           const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
-          console.log("[書斎] weave usage", json.usage);
+          console.log("[書斎] weave usage", json.usage, "読", json.usage && json.usage.cache_read_input_tokens, "書", cacheWriteTokens(json.usage));
           // 綴じと同じく、テキスト化された呼び出しは取り除き、中身は手控えとして回収する
           const finalized = finalizeAssistantContent(json.content);
           if (room.jotNote && finalized.jotted.length > 0) addNotes(room.id, finalized.jotted);
@@ -2619,7 +2670,7 @@ function App() {
           );
           // tool_choice: none なので通常は書き付けられないが、万一書き付けられたら手控えとして残す
           const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
-          console.log("[書斎] bundle usage", json.usage);
+          console.log("[書斎] bundle usage", json.usage, "読", json.usage && json.usage.cache_read_input_tokens, "書", cacheWriteTokens(json.usage));
           // tool_choice: none だと呼び出しを本文にテキストで書くことがある。記録帳に入ると毎回注入されて真似が広がるので、
           // 必ず取り除き、中身は手控えとして回収する
           const finalized = finalizeAssistantContent(json.content);
