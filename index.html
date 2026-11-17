@@ -511,9 +511,30 @@ function localDayKey(iso) {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-// createdAt が読める時刻か（古いメッセージには無い。壊れた値も「時刻なし」扱い）
-function hasCreatedAt(m) {
-  return !!m && typeof m.createdAt === "string" && !isNaN(new Date(m.createdAt).getTime());
+// 発言の時刻 ts が読めるか（壊れた値・欠けた値は「時刻なし」扱い）。
+// ts＝自分の発言は送信時刻、モデルの発言は応答完了時刻。表示・ログ専用で、API には送らない
+function hasMsgTime(m) {
+  return !!m && typeof m.ts === "string" && !isNaN(new Date(m.ts).getTime());
+}
+
+// 発言の時刻は ts に一本化する。一時期 createdAt と二重に持っていたので、読み込み時に ts へ寄せて createdAt を外す
+// （ts が無く createdAt だけある発言は createdAt を ts として使う）。変更が無ければ同じ配列を返す
+function normalizeThreadMessages(threads) {
+  if (!Array.isArray(threads)) return threads;
+  let changed = false;
+  const next = threads.map((t) => {
+    if (!t || !Array.isArray(t.messages) || !t.messages.some((m) => m && "createdAt" in m)) return t;
+    changed = true;
+    return {
+      ...t,
+      messages: t.messages.map((m) => {
+        if (!m || !("createdAt" in m)) return m;
+        const { createdAt, ...rest } = m;
+        return rest.ts ? rest : { ...rest, ts: createdAt };
+      }),
+    };
+  });
+  return changed ? next : threads;
 }
 
 /* ----- マークダウン表示（モデルの発言だけ。表示専用で、保存・送信・ログの本文は生テキストのまま） ----- */
@@ -781,7 +802,7 @@ function buildThreadText(building, room, thread) {
   const parts = [`栞 ─ ${building.name} / ${room.name}\n${thread.title}（${thread.frozenDate}）`];
   thread.messages.forEach((m) => {
     // 時刻のある発言だけ頭に [11/17 21:24] を付ける（時刻のない古い発言は今までどおり）
-    const stamp = hasCreatedAt(m) ? `${formatLogStamp(m.createdAt)} ` : "";
+    const stamp = hasMsgTime(m) ? `${formatLogStamp(m.ts)} ` : "";
     if (m.role === "user") {
       parts.push(`${stamp}【多恵子】\n${extractPlainText(m.content)}`);
       return;
@@ -1788,11 +1809,10 @@ function ConversationScreen({
         throw new ShosaiError(message, { raw: emptyResponseDetail(json) });
       }
 
-      // createdAt は応答が最終的に完了した時刻（継続ループ後）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）
-      const doneAt = nowISO();
+      // ts は応答が最終的に完了した時刻（継続ループ後）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）
       const assistantMessage = {
         role: "assistant", content: finalized.content,
-        ts: doneAt, createdAt: doneAt, usage: json.usage, stopReason: json.stop_reason,
+        ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
       if (jotted.length > 0) assistantMessage.jotted = jotted;
       jumpPendingRef.current = true;
@@ -1813,8 +1833,7 @@ function ConversationScreen({
     const text = draft.trim();
     if (!text || sending) return;
     setDraft("");
-    const sentAt = nowISO();
-    const userMessage = { role: "user", content: text, ts: sentAt, createdAt: sentAt };
+    const userMessage = { role: "user", content: text, ts: nowISO() };
     sendToModel([...thread.messages, userMessage]);
   }
 
@@ -1845,8 +1864,7 @@ function ConversationScreen({
     setConfirmResend(null);
     cancelEdit();
     // 編集後の発言は再送信した時刻で作り直す
-    const sentAt = nowISO();
-    const userMessage = { role: "user", content: text, ts: sentAt, createdAt: sentAt };
+    const userMessage = { role: "user", content: text, ts: nowISO() };
     sendToModel([...thread.messages.slice(0, index), userMessage]);
   }
 
@@ -1908,16 +1926,16 @@ function ConversationScreen({
         )}
         {thread.messages.map((m, i) => {
           // 日付の区切り：直前の「時刻つき」発言とローカル日付が違うとき（時刻つきの最初の発言の前にも）。時刻なしの発言は飛ばす
-          const timed = hasCreatedAt(m);
+          const timed = hasMsgTime(m);
           let showDateSep = false;
           if (timed) {
             let prev = null;
-            for (let j = i - 1; j >= 0; j--) { if (hasCreatedAt(thread.messages[j])) { prev = thread.messages[j]; break; } }
-            showDateSep = !prev || localDayKey(prev.createdAt) !== localDayKey(m.createdAt);
+            for (let j = i - 1; j >= 0; j--) { if (hasMsgTime(thread.messages[j])) { prev = thread.messages[j]; break; } }
+            showDateSep = !prev || localDayKey(prev.ts) !== localDayKey(m.ts);
           }
           return (
           <React.Fragment key={i}>
-          {showDateSep && <div className="date-sep">{formatDateSep(m.createdAt)}</div>}
+          {showDateSep && <div className="date-sep">{formatDateSep(m.ts)}</div>}
           <div
             className={`msg ${m.role === "user" ? "msg-user" : "msg-model"}${m.role === "user" && editingIndex === i ? " editing" : ""}`}
             style={m.ts && m.ts === streamedTsRef.current ? { animation: "none" } : undefined}
@@ -1936,7 +1954,7 @@ function ConversationScreen({
             ) : (
               <MessageContent content={m.content} markdown />
             )}
-            {timed && !(m.role === "user" && editingIndex === i) && <div className="msg-time">{formatTimeHM(m.createdAt)}</div>}
+            {timed && !(m.role === "user" && editingIndex === i) && <div className="msg-time">{formatTimeHM(m.ts)}</div>}
             {m.role === "user" && editingIndex !== i && (
               <div className="msg-tools">
                 <button onClick={() => startEdit(i)} disabled={sending || bundling || editingIndex !== null}>編集</button>
@@ -2373,7 +2391,12 @@ function App() {
   const [theme, setTheme] = useState(initialTheme);
   const [buildings, setBuildingsState] = useState(() => loadJSON(K.buildings, []));
   const [rooms, setRoomsState] = useState(() => loadJSON(K.rooms, []));
-  const [threads, setThreadsState] = useState(() => loadJSON(K.threads, []));
+  const [threads, setThreadsState] = useState(() => {
+    const loaded = loadJSON(K.threads, []);
+    const normalized = normalizeThreadMessages(loaded);
+    if (normalized !== loaded) saveJSON(K.threads, normalized);
+    return normalized;
+  });
   const [memories, setMemoriesState] = useState(() => loadJSON(K.memories, []));
   const [retrospects, setRetrospectsState] = useState(() => loadJSON(K.retrospects, {}));
   const [notes, setNotesState] = useState(() => loadJSON(K.notes, []));
@@ -2496,7 +2519,7 @@ function App() {
           // 全置き換え。APIキーとテーマには触らない
           saveJSON(K.buildings, data.buildings);
           saveJSON(K.rooms, data.rooms);
-          saveJSON(K.threads, data.threads);
+          saveJSON(K.threads, normalizeThreadMessages(data.threads));
           saveJSON(K.memories, data.memories);
           // 回想録キーの無い旧バックアップも読み込める
           saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {});
