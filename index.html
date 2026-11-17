@@ -361,6 +361,8 @@ const K = {
   retrospects: "shosai_retrospects",
   notes: "shosai_notes",
   lastThreadId: "shosai_last_thread_id",
+  // スレッドごとに「前回送った block2（記録帳・回想録・手控え欄）」を控える。バックアップには含めない
+  block2Snapshots: "shosai_block2_snapshots",
 };
 
 const WEB_SEARCH_MAX_USES = 3;
@@ -1186,6 +1188,7 @@ async function callModelRetryOnEmpty(args, onJotted) {
 // options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
 //          / block1Only（system をブロック1だけにする。「回想録を編む」用）
 //          / effort（output_config.effort。綴じ・編みだけが "low" を渡す。通常送信には付けない）
+//          / block2Text（block2 の本文。resolveBlock2 で据え置いたものを渡す。省略時はその場で組み立てる）
 //          thinking パラメータは一切送らない（Opus 5.5 等では disabled も enabled も400になる）
 function buildRequestBody({ building, room, memories, retrospects, notes, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
@@ -1194,7 +1197,8 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
   const system = [block1];
   if (!options.block1Only) {
-    system.push({ type: "text", text: buildBlock2(room, memories, retrospects, notes, frozenDate), cache_control: cc });
+    const block2Text = typeof options.block2Text === "string" ? options.block2Text : buildBlock2(room, memories, retrospects, notes, frozenDate);
+    system.push({ type: "text", text: block2Text, cache_control: cc });
   }
   // tools の構成は部屋設定だけで決まる（通常送信・綴じ・編むで一致させ、キャッシュのプレフィックスを揃える）
   const toolList = [];
@@ -1266,6 +1270,42 @@ function buildBlock2(room, memories, retrospects, notes, frozenDate) {
     ? `【手控え ─ 会話の途中で自分が書き付けたこと】\n${roomNotes.map((n) => `・${formatYMD(n.createdAt)}：${n.text}`).join("\n")}\n\n`
     : "";
   return `${retrospectText}${notesText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
+}
+
+/* ----- block2 の据え置き -----
+   block2（回想録・手控え・記録帳）は system の2つ目で、会話履歴より前にある。中身が1文字でも変わると、
+   それ以降（会話全体）のキャッシュが無効になって書き直しになる。そこで、スレッドごとに前回送った block2 を控えておき、
+   次のときだけ作り直す。それ以外（ツールループの途中・キャッシュが生きている間の通常送信・綴じ）は控えをそのまま送る。
+   ・新しいスレッド（控えが無い）
+   ・前回のリクエストから部屋の TTL 以上経った（どうせキャッシュは切れている）
+   ・綴じ・編みのあと／記録帳で記録・手控えを編集・追加・削除したとき（invalidateBlock2 で控えを捨てる）
+   書き付けた手控えは保存・表示は即時、block2 への反映だけが上の時機まで遅れる。 */
+function cacheTtlMs(room) {
+  return room.cacheTtl === "1h" ? 60 * 60 * 1000 : 5 * 60 * 1000;
+}
+
+// このスレッドで送る block2 を返し、送信時刻を控えに記録する
+function resolveBlock2({ room, thread, memories, retrospects, notes }) {
+  const snaps = loadJSON(K.block2Snapshots, {});
+  const snap = snaps[thread.id];
+  const now = Date.now();
+  let reason = null;
+  if (!snap || snap.roomId !== room.id || typeof snap.text !== "string") reason = "控えなし（新しいスレッド・作り直し後）";
+  else if (!(now - new Date(snap.lastSentAt).getTime() < cacheTtlMs(room))) reason = "TTL 経過";
+  const text = reason ? buildBlock2(room, memories, retrospects, notes, thread.frozenDate) : snap.text;
+  if (reason) console.log(`[書斎] block2 を作り直した（${reason}）`);
+  else console.log("[書斎] block2 は前回送ったものをそのまま使う");
+  snaps[thread.id] = { roomId: room.id, text, lastSentAt: new Date(now).toISOString() };
+  saveJSON(K.block2Snapshots, snaps);
+  return text;
+}
+
+// 控えを捨てる（次の送信で作り直す）。roomId を渡せばその部屋のスレッドだけ、省略で全部
+function invalidateBlock2(roomId) {
+  if (roomId === undefined) { localStorage.removeItem(K.block2Snapshots); return; }
+  const snaps = loadJSON(K.block2Snapshots, {});
+  Object.keys(snaps).forEach((id) => { if (snaps[id] && snaps[id].roomId === roomId) delete snaps[id]; });
+  saveJSON(K.block2Snapshots, snaps);
 }
 
 /* ===== データ層 ===== */
@@ -1822,7 +1862,9 @@ function ConversationScreen({
     setSending(true);
 
     try {
-      const body = buildRequestBody({ building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages);
+      // block2 は据え置き（resolveBlock2）。ツールループの各周は同じ body を使うので、ターン内でも変わらない
+      const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
+      const body = buildRequestBody({ building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages, { block2Text });
       let json;
       try {
         json = await callModelWithContinuation({
@@ -2564,6 +2606,7 @@ function App() {
           setMemories(plan.next.memories);
           setRetrospects(plan.next.retrospects);
           setNotes(plan.next.notes);
+          invalidateBlock2(); // 記録帳・回想録・手控えを書き換えたので、全スレッドの控えを捨てる
           return plan.summary;
         }}
         onRestoreBackup={(data) => {
@@ -2577,6 +2620,7 @@ function App() {
           // 手控えキーの無い旧バックアップも読み込める
           saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []);
           localStorage.removeItem(K.lastThreadId);
+          invalidateBlock2(); // データを丸ごと入れ替えたので控えも捨てる
           window.location.reload();
         }}
       />
@@ -2592,13 +2636,14 @@ function App() {
         retrospect={retrospects[room.id] || null}
         notes={notes.filter((n) => n.roomId === room.id)}
         onBack={goBack}
-        onDeleteMemory={(id) => setMemories(memories.filter((m) => m.id !== id))}
-        onDeleteNote={(id) => setNotes(notes.filter((n) => n.id !== id))}
+        // 記録帳での編集・追加・削除は、次の送信から block2 に反映する（invalidateBlock2）
+        onDeleteMemory={(id) => { setMemories(memories.filter((m) => m.id !== id)); invalidateBlock2(room.id); }}
+        onDeleteNote={(id) => { setNotes(notes.filter((n) => n.id !== id)); invalidateBlock2(room.id); }}
         // 編集・追加は痕跡を残さない（editedAt 等のフィールドを作らない）。text だけを差し替え、createdAt は保つ
-        onSaveMemory={(id, text) => setMemories(memories.map((m) => (m.id === id ? { ...m, text } : m)))}
-        onSaveNote={(id, text) => setNotes(notes.map((n) => (n.id === id ? { ...n, text } : n)))}
-        onAddMemory={(text) => setMemories([...memories, { id: uid(), roomId: room.id, text, createdAt: nowISO(), woven: false }])}
-        onAddNote={(text) => setNotes([...notes, { id: uid(), roomId: room.id, text, createdAt: nowISO() }])}
+        onSaveMemory={(id, text) => { setMemories(memories.map((m) => (m.id === id ? { ...m, text } : m))); invalidateBlock2(room.id); }}
+        onSaveNote={(id, text) => { setNotes(notes.map((n) => (n.id === id ? { ...n, text } : n))); invalidateBlock2(room.id); }}
+        onAddMemory={(text) => { setMemories([...memories, { id: uid(), roomId: room.id, text, createdAt: nowISO(), woven: false }]); invalidateBlock2(room.id); }}
+        onAddNote={(text) => { setNotes([...notes, { id: uid(), roomId: room.id, text, createdAt: nowISO() }]); invalidateBlock2(room.id); }}
         onWeave={async () => {
           // 編む対象：woven に関わらず、全記録のうち直近10件を除いたものを古い順に全件。
           // 毎回全量から再生成することで、過去に編んだ内容の劣化コピーの連鎖を防ぐ。
@@ -2633,6 +2678,7 @@ function App() {
           const targetIds = new Set(targets.map((m) => m.id));
           setMemories(memories.map((m) => (targetIds.has(m.id) ? { ...m, woven: true } : m)));
           setRetrospects({ ...retrospects, [room.id]: { text, updatedAt: nowISO() } });
+          invalidateBlock2(room.id); // 編んだ回想録を次の送信から block2 に入れる
         }}
       />
     );
@@ -2658,10 +2704,13 @@ function App() {
           // 棟のモデル本人が、会話の続きとして自分で綴じる。
           // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
           // 綴じ指示と応答は thread.messages に保存しない。
+          // block2 も通常送信と同じ据え置きのものを使い、プレフィックスを一致させる
+          const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
           const body = buildRequestBody(
             { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate },
             thread.messages,
             {
+              block2Text,
               maxTokens: BUNDLE_MAX_TOKENS,
               toolChoice: { type: "none" }, // tools は外さず、検索の実行だけを封じる
               effort: "low", // 思考の中で書き終えて本文が空になるのを防ぐ
@@ -2684,6 +2733,7 @@ function App() {
           }
           const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
           setMemories([...memories, memory]);
+          invalidateBlock2(room.id); // 綴じた記録を次の送信から block2 に入れる
         }}
       />
     );
