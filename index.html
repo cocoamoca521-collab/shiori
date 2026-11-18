@@ -254,6 +254,11 @@
   .citations a { color: var(--accent-text); }
   .thread-cost { margin-left: 10px; font-size: 11px; color: var(--faint); cursor: pointer; font-family: "Zen Kaku Gothic New", sans-serif; letter-spacing: 0.02em; white-space: nowrap; }
   .thread-cost:hover { color: var(--accent-text); }
+  .spend-caret { display: inline-block; width: 1.1em; color: var(--muted); font-size: 11px; }
+  .spend-detail { margin: 0 0 6px 1.1em; font-size: 11px; color: var(--muted); font-family: "Zen Kaku Gothic New", sans-serif; line-height: 1.6; }
+  .spend-detail-row { padding: 4px 0; border-bottom: 1px dashed var(--rule); display: flex; flex-wrap: wrap; column-gap: 8px; }
+  .spend-detail-ts { color: var(--faint); white-space: nowrap; }
+  .spend-notice { margin-top: -12px; }
   .spend-head { color: var(--muted); font-size: 12px; margin-top: 16px; }
   .spend-note { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.7; }
   .price-row { border-bottom: 1px solid var(--rule); padding: 12px 0; }
@@ -1122,6 +1127,34 @@ function formatUSD(x) {
   return `$${v < 1 ? v.toFixed(4) : v.toFixed(2)}`;
 }
 
+// usage の「読 ・ 書 ・ 素 ・ 出」の文字列（発言の usage 行と同じ並び）
+function usageCountsText(usage) {
+  const fmt = (n) => (n || 0).toLocaleString();
+  const u = usage || {};
+  return `読 ${fmt(u.cache_read_input_tokens)} ・ 書 ${fmt(cacheWriteTokens(u))} ・ 素 ${fmt(u.input_tokens)} ・ 出 ${fmt(u.output_tokens)}`;
+}
+
+// 1回以上のリクエスト（{ model, usage }）の合計 usage と金額。各回を個別に計算して足す。1回でも単価未設定なら cost は null
+function roundsSpend(rounds, ttl, table) {
+  let usage = null;
+  let cost = 0;
+  (rounds || []).forEach((r) => {
+    if (!r || !r.usage) return;
+    usage = sumUsage(usage, { ...r.usage, cache_creation_input_tokens: cacheWriteTokens(r.usage) });
+    const c = requestCost(r.usage, r.model, ttl, table);
+    cost = cost === null || !c ? null : cost + c.total;
+  });
+  return { usage, cost };
+}
+
+// 綴じ・編みの完了メッセージ。例：「綴じました ・ 読 0 ・ 書 0 ・ 素 32,118 ・ 出 612 ・ $0.1407（再試行1回）」
+function spendNoticeText(label, rounds, retries, ttl, table) {
+  const { usage, cost } = roundsSpend(rounds, ttl, table);
+  const counts = usage ? ` ・ ${usageCountsText(usage)}` : "";
+  const money = !usage ? "" : cost === null ? " ・ 単価未設定" : ` ・ ${formatUSD(cost)}`;
+  return `${label}${counts}${money}${retries > 0 ? `（再試行${retries}回）` : ""}`;
+}
+
 // 保存済みの発言の usage から帳簿を作る（帳簿の無い既存スレッドを初めて開いたときに一度だけ）。
 // モデルは発言に保存されていればそれ、無ければその時点の棟のモデルで代用して記録する
 function ledgerFromMessages(thread, fallbackModel) {
@@ -1428,8 +1461,10 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onRo
 // 2回とも空なら最後の結果をそのまま返し、空応答のエラー表示は呼び出し側の既存判定に任せる。
 // 通常会話の送信には使わないこと（そちらはエラー表示→ユーザーが再送）。
 // effort に対応しないモデル（Haiku 4.5 など）で output_config が400になった場合は、effort を外して送り直す。
+// 返り値には、全試行の周ごとの usage（allRounds）と自動再試行の回数（retries）を添える（完了メッセージの usage・金額表示用）。
 async function callModelRetryOnEmpty(args, onJotted) {
   let json;
+  const allRounds = [];
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       try {
@@ -1446,6 +1481,8 @@ async function callModelRetryOnEmpty(args, onJotted) {
       throw e;
     }
     if (json.jotted.length > 0 && onJotted) onJotted(json.jotted);
+    allRounds.push(...(json.rounds || []));
+    json = { ...json, allRounds, retries: attempt - 1 };
     if (hasVisibleText(finalizeAssistantContent(json.content).content)) return json;
     console.warn(`[書斎] 空応答（${attempt}回目）stop_reason`, json.stop_reason, json.usage);
   }
@@ -2041,13 +2078,38 @@ function UsageLine({ usage, stopReason, cost }) {
 }
 
 // スレッドの支出の内訳（ヘッダーの金額をタップで開く）
-function SpendBreakdownDialog({ title, summary, onClose }) {
-  const row = (label, value, note) => (
-    <div className="kv-row" style={{ padding: "6px 0" }}>
-      <span>{label}{note ? <span style={{ color: "var(--muted)", fontSize: 12, marginLeft: 6 }}>{note}</span> : null}</span>
+// 「綴じ」「編み」の行はタップで1回ごとの記録（日時・読・書・素・出・金額）を開く
+const SPEND_DETAIL_KINDS = new Set(["bundle", "weave"]);
+
+function SpendBreakdownDialog({ title, summary, entries, ttl, priceTable, onClose }) {
+  const [openKind, setOpenKind] = useState(null);
+  const row = (label, value, note, onClick, open) => (
+    <div className="kv-row" style={{ padding: "6px 0", cursor: onClick ? "pointer" : undefined }} onClick={onClick}>
+      <span>
+        {onClick ? <span className="spend-caret">{open ? "▾" : "▸"}</span> : null}
+        {label}{note ? <span style={{ color: "var(--muted)", fontSize: 12, marginLeft: 6 }}>{note}</span> : null}
+      </span>
       <span>{formatUSD(value)}</span>
     </div>
   );
+  // 新しい順に1回ずつ。自動再試行・継続の各回も1行ずつ出る
+  const details = (kind) => {
+    const list = (entries || []).filter((e) => e && e.usage && e.kind === kind);
+    if (list.length === 0) return <div className="spend-detail">まだ記録はない。</div>;
+    return (
+      <div className="spend-detail">
+        {list.slice().reverse().map((e, i) => {
+          const c = requestCost(e.usage, e.model, ttl, priceTable);
+          return (
+            <div key={i} className="spend-detail-row">
+              <span className="spend-detail-ts">{e.ts ? formatLogStamp(e.ts).slice(1, -1) : "日時不明"}</span>
+              <span>{usageCountsText(e.usage)} ・ {c ? formatUSD(c.total) : "単価未設定"}</span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
   return (
     <div className="overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -2057,7 +2119,14 @@ function SpendBreakdownDialog({ title, summary, onClose }) {
           <span>{formatUSD(summary.total)}{summary.unpriced > 0 ? "（一部未計上）" : ""}</span>
         </div>
         <div className="spend-head">種別</div>
-        {SPEND_KINDS.map(({ k, label }) => row(label, summary.byKind[k], `${summary.counts[k]}回`))}
+        {SPEND_KINDS.map(({ k, label }) => (
+          <React.Fragment key={k}>
+            {SPEND_DETAIL_KINDS.has(k)
+              ? row(label, summary.byKind[k], `${summary.counts[k]}回`, () => setOpenKind(openKind === k ? null : k), openKind === k)
+              : row(label, summary.byKind[k], `${summary.counts[k]}回`)}
+            {openKind === k && details(k)}
+          </React.Fragment>
+        ))}
         <div className="spend-head">項目</div>
         {row("入力", summary.byCat.input)}
         {row("書き込み", summary.byCat.write)}
@@ -2107,6 +2176,7 @@ function ConversationScreen({
   const [confirmResend, setConfirmResend] = useState(null); // { index, count }
   const [streamText, setStreamText] = useState(""); // ストリーミング中の本文（保存前のプレーン表示用）
   const [showSpend, setShowSpend] = useState(false); // 支出の内訳を開いているか
+  const [bundleNotice, setBundleNotice] = useState(null); // 綴じの完了メッセージ（usage と金額）。次の送信・綴じで消す
   const ttl = room.cacheTtl === "1h" ? "1h" : "5m";
   const spend = summarizeLedger(ledger, ttl, priceTable);
   const bottomRef = useRef(null);
@@ -2180,6 +2250,7 @@ function ConversationScreen({
   // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
   async function sendToModel(nextMessages) {
     setError(null);
+    setBundleNotice(null);
     jumpedRef.current = false;
     jumpPendingRef.current = false;
     followRef.current = true;
@@ -2320,8 +2391,9 @@ function ConversationScreen({
     setMenuOpen(false);
     setBundling(true);
     setError(null);
+    setBundleNotice(null);
     try {
-      await onOpenBundleMemory();
+      setBundleNotice(await onOpenBundleMemory());
     } catch (e) {
       setError(e);
     } finally {
@@ -2405,6 +2477,7 @@ function ConversationScreen({
             : <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>
         )}
         {bundling && <div className="msg msg-loading">（記憶を綴じている）</div>}
+        {!bundling && bundleNotice && <div className="usage-line spend-notice">{bundleNotice}</div>}
         <div ref={bottomRef} />
       </div>
 
@@ -2423,7 +2496,10 @@ function ConversationScreen({
       </div>
 
       {showSpend && (
-        <SpendBreakdownDialog title={`このスレッドの支出 ─ ${thread.title}`} summary={spend} onClose={() => setShowSpend(false)} />
+        <SpendBreakdownDialog
+          title={`このスレッドの支出 ─ ${thread.title}`} summary={spend}
+          entries={ledger} ttl={ttl} priceTable={priceTable} onClose={() => setShowSpend(false)}
+        />
       )}
 
       {confirmResend && (
@@ -2460,6 +2536,7 @@ function MemoriesScreen({
   onDeleteMemory, onDeleteNote, onSaveMemory, onSaveNote, onAddMemory, onAddNote, onWeave,
 }) {
   const [weaving, setWeaving] = useState(false);
+  const [weaveNotice, setWeaveNotice] = useState(null); // 編みの完了メッセージ（usage と金額）
   const [confirmWeave, setConfirmWeave] = useState(false);
   const [error, setError] = useState(null);
   // 編集・追加は同時に1件まで。{ kind: "memory" | "note", id: 既存なら id、新規なら null }
@@ -2480,8 +2557,9 @@ function MemoriesScreen({
     setConfirmWeave(false);
     setWeaving(true);
     setError(null);
+    setWeaveNotice(null);
     try {
-      await onWeave();
+      setWeaveNotice(await onWeave());
     } catch (e) {
       setError(e);
     } finally {
@@ -2546,6 +2624,7 @@ function MemoriesScreen({
       )}
 
       {weaving && <div className="msg msg-loading">（回想録を編んでいる）</div>}
+      {!weaving && weaveNotice && <div className="usage-line" style={{ marginTop: 0, marginBottom: 12 }}>{weaveNotice}</div>}
       <ErrorBox error={error} />
 
       {/* 回想録は「回想録を編む」でのみ更新する。編集・削除・追加のUIは付けない */}
@@ -3232,6 +3311,8 @@ function App() {
           setMemories(memories.map((m) => (targetIds.has(m.id) ? { ...m, woven: true } : m)));
           setRetrospects({ ...retrospects, [room.id]: { text, updatedAt: nowISO() } });
           invalidateBlock2(room.id); // 編んだ回想録を次の送信から block2 に入れる
+          // 完了メッセージ（usage と金額。自動再試行があれば全試行の合計）
+          return spendNoticeText("編みました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable);
         }}
       />
     );
@@ -3297,6 +3378,8 @@ function App() {
           const memory = { id: uid(), roomId: room.id, text, createdAt: nowISO() };
           setMemories([...memories, memory]);
           invalidateBlock2(room.id); // 綴じた記録を次の送信から block2 に入れる
+          // 完了メッセージ（usage と金額。自動再試行があれば全試行の合計）
+          return spendNoticeText("綴じました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable);
         }}
       />
     );
