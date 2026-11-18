@@ -267,6 +267,16 @@
   .price-grid input { padding: 6px 6px; font-size: 13px; border-radius: 8px; }
   @media (max-width: 480px) { .price-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .usage-line { color: var(--faint); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .spend-notice { white-space: pre-wrap; }
+  /* 思考：usage 行の行末の開閉と、展開した本文（プレーンテキスト・控えめな薄い帯） */
+  .usage-row { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 4px; }
+  .thinking-toggle { border: none; background: none; padding: 0 2px; font: inherit; font-size: 11px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .thinking-toggle:hover, .thinking-toggle:active { color: var(--accent-text); }
+  .translate-btn { margin-left: auto; border: 1px solid var(--input-border); background: transparent; border-radius: 10px; padding: 2px 10px; font: inherit; font-size: 11px; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  .translate-btn:hover, .translate-btn:active { color: var(--accent-text); border-color: var(--quote-line); }
+  .thinking-body { margin-top: 6px; padding: 10px 12px; border-radius: 10px; background: var(--code-inline-bg); color: var(--muted); font-size: 12px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Zen Kaku Gothic New", sans-serif; }
+  /* 出力中に流す思考（本文と見分けがつく控えめな見た目） */
+  .stream-thinking { color: var(--muted); font-size: 12px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; font-family: "Zen Kaku Gothic New", sans-serif; }
   .jotted-line { color: var(--jot); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; line-height: 1.6; }
   .jotted-line + .jotted-line { margin-top: 2px; }
   .msg-tools { margin-top: 4px; }
@@ -327,6 +337,9 @@
   .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
   .field textarea { min-height: 140px; }
   .toggle-row { display: flex; align-items: center; gap: 10px; }
+  .effort-options { display: flex; flex-wrap: wrap; column-gap: 18px; row-gap: 4px; margin-top: 4px; }
+  .field-note { font-size: 11px; color: var(--faint); margin-top: 6px; line-height: 1.6; }
+  .field-note-inline { font-size: 11px; color: var(--faint); margin-left: 8px; }
   .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
 
   .confirm-text { margin-bottom: 18px; font-size: 14px; }
@@ -384,7 +397,16 @@ const K = {
 };
 
 const WEB_SEARCH_MAX_USES = 3;
-const MAX_TOKENS = 4096;
+// 通常送信・編集＆再送信の出力上限。思考トークンもこの上限に含まれるので、本文が途中で切れないよう大きめに取る
+// （課金は実際に使った分だけ）。effort が xhigh / max の部屋は思考が長くなるのでさらに広げる
+const MAX_TOKENS = 16000;
+const MAX_TOKENS_HIGH_EFFORT = 32000;
+// モデルの出力上限を超えて 400 になったときに下げる値（1回だけ送り直す）
+const FALLBACK_MAX_TOKENS = 4096;
+// 部屋設定「考える深さ（effort）」の選択肢。おまかせ（指定しない）は room.effort を持たない
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+// 「思考を見る」部屋の通常送信に付ける thinking パラメータ（要約された思考が thinking ブロックに入って届く）
+const SHOW_THINKING_PARAM = { type: "adaptive", display: "summarized" };
 const RECENT_KEEP_COUNT = 10; // 「編む」とき、直近として個別注入に残す記録の件数
 const WEAVE_MIN_OLD = 5; // 直近を除いた未編み記録がこの件数に達したら「回想録を編む」を出す
 // 綴じ・編みの出力上限。思考が常時ONのモデル（Opus 5.5 等）では思考トークンもこの上限に含まれるため、
@@ -872,7 +894,9 @@ function buildThreadText(building, room, thread) {
       ? m.content.filter((b) => b.type === "text").flatMap((b) => b.citations || [])
       : [];
     if (citations.length > 0) body += "\n" + citations.map((c) => `出典: ${c.url}`).join("\n");
-    parts.push(`${stamp}【${room.name}】\n${body}`);
+    // 思考（「思考を見る」部屋で保存したもの）は本文の前に〔思考〕の区画で入れる
+    const thinking = typeof m.thinking === "string" && m.thinking.trim() !== "" ? `〔思考〕\n${m.thinking.trim()}\n〔/思考〕\n\n` : "";
+    parts.push(`${stamp}【${room.name}】\n${thinking}${body}`);
   });
   return parts.join("\n\n") + "\n";
 }
@@ -1200,8 +1224,9 @@ function normalizeLedgers(data) {
 }
 
 // SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
-// text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
-async function readAnthropicStream(res, onDelta) {
+// text_delta のフラグメントを onDelta に流す。thinking_delta は onThinkingDelta（任意）に (文字列, そのブロックの最初の断片か) で流す。
+// 途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
+async function readAnthropicStream(res, onDelta, onThinkingDelta) {
   const content = [];
   const partialJson = {}; // index → 連結中の input_json_delta
   let usage = {};
@@ -1237,7 +1262,10 @@ async function readAnthropicStream(res, onDelta) {
         } else if (delta.type === "input_json_delta") {
           partialJson[data.index] = (partialJson[data.index] || "") + (delta.partial_json || "");
         } else if (delta.type === "thinking_delta") {
-          block.thinking = (block.thinking || "") + (delta.thinking || ""); // 表示には流さない
+          const first = !block.thinking;
+          block.thinking = (block.thinking || "") + (delta.thinking || "");
+          // 「思考を見る」部屋では要約された思考が届くので、出力中の表示に流す（保存はターン完了時に callModelWithContinuation がまとめる）
+          if (delta.thinking && typeof onThinkingDelta === "function") onThinkingDelta(delta.thinking, first);
         } else if (delta.type === "signature_delta") {
           block.signature = (block.signature || "") + (delta.signature || "");
         } else if (delta.type === "citations_delta") {
@@ -1315,7 +1343,7 @@ async function readAnthropicStream(res, onDelta) {
 // Anthropic Messages APIをブラウザから直接呼ぶ唯一の窓口
 // body は buildRequestBody で組み立てたものをそのまま送る
 // onDelta が渡されたときだけストリーミングで受け取る（通常送信のみ）。返り値の形はどちらも同じ。
-async function anthropicMessages({ apiKey, body, onDelta }) {
+async function anthropicMessages({ apiKey, body, onDelta, onThinkingDelta }) {
   const streaming = typeof onDelta === "function";
   if (streaming) body = { ...body, stream: true };
   let res;
@@ -1338,7 +1366,7 @@ async function anthropicMessages({ apiKey, body, onDelta }) {
     const errJson = await res.json().catch(() => null);
     throw buildApiError(res.status, errJson, body.model);
   }
-  const json = streaming ? await readAnthropicStream(res, onDelta) : await res.json().catch(() => null);
+  const json = streaming ? await readAnthropicStream(res, onDelta, onThinkingDelta) : await res.json().catch(() => null);
   if (!json) throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: "応答を読めなかった" });
   if (json.usage) {
     // 非ストリーミング（綴じ・編み）は応答の usage をそのまま使う。調査用に生の値を出す
@@ -1350,11 +1378,11 @@ async function anthropicMessages({ apiKey, body, onDelta }) {
 
 // 棟のプロバイダを見て呼び先を切り替える。現時点ではanthropicのみ実装。
 // 将来 provider: "gemini" 等を追加する際はここに分岐を足すだけでよい。
-async function callModel({ building, apiKey, body, onDelta }) {
+async function callModel({ building, apiKey, body, onDelta, onThinkingDelta }) {
   switch (building.provider) {
     case "anthropic":
     default:
-      return anthropicMessages({ apiKey, body, onDelta });
+      return anthropicMessages({ apiKey, body, onDelta, onThinkingDelta });
   }
 }
 
@@ -1381,7 +1409,10 @@ function runClientTool(block, jotted) {
 // onDelta（任意）は各周回にそのまま渡す。tool_use を挟んだ続きは空行を1つ挟んで同じ流れとして文字が増えていく。
 // onRound（任意）は usage が返ってきた周ごとに { model, usage } で呼ぶ（支出の帳簿用。途中でエラーになっても、それまでの周は呼ばれている）。
 // rounds は全周の { model, usage }（各回を個別に金額計算するため）、model は最終周を返したモデル。
-async function callModelWithContinuation({ building, apiKey, body, onDelta, onRound }) {
+// onThinkingDelta（任意）は各周回の thinking_delta をそのまま渡す（出力中の表示用）。
+// thinking は全周の thinking ブロックの本文を出現順に空行で連結したもの（無ければ ""。表示・ログ専用で、API には送り返さない）。
+// 途中でエラーになった場合は、それまでに usage が返ってきた周の数を error.roundsDone に載せる（未対応パラメータの送り直しの判定用）。
+async function callModelWithContinuation({ building, apiKey, body, onDelta, onThinkingDelta, onRound }) {
   const content = [];
   const rounds = [];
   const jotted = [];
@@ -1402,7 +1433,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onRo
     : undefined;
   try {
     for (let round = 1; ; round++) {
-      json = await callModel({ building, apiKey, body, onDelta: delta });
+      json = await callModel({ building, apiKey, body, onDelta: delta, onThinkingDelta });
       console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
       // 各周の「書」を先に確定させてから足す（周ごとに cache_creation_input_tokens の有無が違っても取りこぼさない）
       if (json.usage) totalUsage = sumUsage(totalUsage, { ...json.usage, cache_creation_input_tokens: cacheWriteTokens(json.usage) });
@@ -1452,37 +1483,107 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onRo
     }
   } catch (e) {
     if (jotted.length > 0) e.jotted = jotted;
+    e.roundsDone = rounds.length;
     throw e;
   }
-  return { content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, rounds, model: json.model || body.model };
+  return {
+    content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, rounds, model: json.model || body.model,
+    thinking: joinThinkingText(content),
+  };
+}
+
+// 全周の thinking ブロックの本文（block.thinking）を出現順に空行で連結する。redacted_thinking は本文が無いので対象外
+function joinThinkingText(content) {
+  return (content || [])
+    .filter((b) => b && b.type === "thinking" && typeof b.thinking === "string" && b.thinking.trim() !== "")
+    .map((b) => b.thinking.trim())
+    .join("\n\n");
+}
+
+/* ----- 未対応パラメータの送り直し -----
+   モデルが対応していない指定で 400 になったら、その指定だけ外して（下げて）1回だけ送り直す。指定ごとに1回まで。
+   ・max_tokens：モデルの出力上限を超えた → FALLBACK_MAX_TOKENS に下げる
+   ・thinking：adaptive に対応しない旧モデル（Opus 4.5 / Sonnet 4.5 / Haiku 4.5 など）→ thinking を外す
+   ・output_config / effort：effort（または xhigh 等の段階）に対応しないモデル → output_config を外す
+   400 で落ちたリクエストは課金されないので帳簿には何も記録しない（onRound は usage が返った周でしか呼ばれない）。
+   1周でも返ってきた後の失敗（ツールループの途中など）は送り直さない（書き付けや支出が二重になるため）。 */
+function apiErrorMessage(e) {
+  try {
+    const j = JSON.parse(e.raw || "");
+    if (j && j.error && typeof j.error.message === "string") return j.error.message;
+  } catch (err) { /* raw が JSON でなければそのまま使う */ }
+  return String(e.raw || e.message || "");
+}
+
+// 400 の原因になった指定を1つ選ぶ。外せるものが無ければ null
+function unsupportedParamOf(e, body, done) {
+  if (!e || e.status !== 400 || e.roundsDone) return null;
+  const msg = apiErrorMessage(e);
+  if (!done.has("max_tokens") && body.max_tokens > FALLBACK_MAX_TOKENS && /max_tokens/i.test(msg)) return "max_tokens";
+  if (!done.has("thinking") && body.thinking && /thinking/i.test(msg)) return "thinking";
+  if (!done.has("effort") && body.output_config && /effort|output_config/i.test(msg)) return "effort";
+  return null;
+}
+
+function dropUnsupportedParam(body, kind) {
+  if (kind === "max_tokens") return { ...body, max_tokens: FALLBACK_MAX_TOKENS };
+  const { [kind === "effort" ? "output_config" : "thinking"]: _dropped, ...rest } = body;
+  return rest;
+}
+
+// 送り直したことを知らせる一行（spend-notice と同じ控えめな行に出す）
+function fallbackNoticeText(kind, body) {
+  const model = body.model || "（不明）";
+  if (kind === "max_tokens") return `この部屋のモデル（${model}）は出力上限 ${body.max_tokens.toLocaleString()} に対応していないため、${FALLBACK_MAX_TOKENS.toLocaleString()} に下げて送った`;
+  if (kind === "thinking") return `この部屋のモデル（${model}）は「思考を見る」の指定に対応していないため、外して送った`;
+  const effort = body.output_config && body.output_config.effort;
+  return `この部屋のモデル（${model}）は考える深さ（effort${effort ? `: ${effort}` : ""}）の指定に対応していないため、外して送った`;
+}
+
+// callModelWithContinuation を呼び、未対応の指定で 400 になったら外して送り直す。
+// 返り値は { json, body, notices }。body は最終的に送ったボディ（綴じ・編みの自動再試行で使い回す）、notices は知らせる文の配列
+async function callModelWithParamFallback(args) {
+  let body = args.body;
+  const done = new Set();
+  const notices = [];
+  for (;;) {
+    try {
+      const json = await callModelWithContinuation({ ...args, body });
+      return { json, body, notices };
+    } catch (e) {
+      const kind = unsupportedParamOf(e, body, done);
+      if (!kind) throw e;
+      console.warn(`[書斎] このモデルは ${kind} の指定に対応していないため、外して（下げて）送り直す`, e.raw);
+      done.add(kind);
+      notices.push(fallbackNoticeText(kind, body));
+      body = dropUnsupportedParam(body, kind);
+    }
+  }
 }
 
 // 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
 // 2回とも空なら最後の結果をそのまま返し、空応答のエラー表示は呼び出し側の既存判定に任せる。
 // 通常会話の送信には使わないこと（そちらはエラー表示→ユーザーが再送）。
-// effort に対応しないモデル（Haiku 4.5 など）で output_config が400になった場合は、effort を外して送り直す。
-// 返り値には、全試行の周ごとの usage（allRounds）と自動再試行の回数（retries）を添える（完了メッセージの usage・金額表示用）。
+// effort に対応しないモデル（Haiku 4.5 など）で output_config が400になった場合は、effort を外して送り直す（callModelWithParamFallback）。
+// 返り値には、全試行の周ごとの usage（allRounds）と自動再試行の回数（retries）、送り直しの知らせ（fallbackNotices）を添える
+// （完了メッセージの usage・金額表示用）。
 async function callModelRetryOnEmpty(args, onJotted) {
   let json;
   const allRounds = [];
+  const fallbackNotices = [];
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      try {
-        json = await callModelWithContinuation(args);
-      } catch (e) {
-        if (!(e.status === 400 && args.body.output_config && /effort|output_config/i.test(e.raw || ""))) throw e;
-        console.warn("[書斎] このモデルは effort に対応していないため、外して送り直す", e.raw);
-        const { output_config, ...bodyWithoutEffort } = args.body;
-        args = { ...args, body: bodyWithoutEffort };
-        json = await callModelWithContinuation(args);
-      }
+      const r = await callModelWithParamFallback(args);
+      json = r.json;
+      args = { ...args, body: r.body }; // 外した指定は自動再試行でも外したまま
+      fallbackNotices.push(...r.notices);
     } catch (e) {
       if (e.jotted && onJotted) onJotted(e.jotted);
       throw e;
     }
     if (json.jotted.length > 0 && onJotted) onJotted(json.jotted);
     allRounds.push(...(json.rounds || []));
-    json = { ...json, allRounds, retries: attempt - 1 };
+    json = { ...json, allRounds, retries: attempt - 1, fallbackNotices };
     if (hasVisibleText(finalizeAssistantContent(json.content).content)) return json;
     console.warn(`[書斎] 空応答（${attempt}回目）stop_reason`, json.stop_reason, json.usage);
   }
@@ -1494,14 +1595,18 @@ async function callModelRetryOnEmpty(args, onJotted) {
 // 綴じる用に別実装を書かないこと。
 // options: maxTokens / toolChoice（tools がある時だけ付与）/ extraMessages（履歴の後ろに足す。キャッシュ境界は付けない）
 //          / block1Only（system をブロック1だけにする。「回想録を編む」用）
-//          / effort（output_config.effort。綴じ・編みだけが "low" を渡す。通常送信には付けない）
+//          / effort（output_config.effort。綴じ・編みは "low" 固定。通常送信・編集＆再送信は部屋の room.effort。
+//            undefined（おまかせ）なら付けず、モデルの既定に任せる）
+//          / thinking（thinking パラメータ。「思考を見る」部屋の通常送信・編集＆再送信だけが SHOW_THINKING_PARAM を渡す）
 //          / block2Text（block2 の本文。resolveBlock2 で据え置いたものを渡す。省略時はその場で組み立てる）
 //          / noCache（cache_control を一切付けない。綴じ・編みだけが true を渡す）
 //            綴じ・編みは tool_choice（none）と effort（low）が通常送信と違うため会話部分のキャッシュに当たらず、
 //            綴じ・編みのあとは block2 も作り直されるので、ここで書き込んだキャッシュは二度と読まれない。
 //            書き込み料金（1時間TTLなら入力の2倍）が丸損になるので、ブレークポイントを置かない。
 //            （ブレークポイントが無いと system のキャッシュも読めず、その分は通常の入力単価になる）
-//          thinking パラメータは一切送らない（Opus 5.5 等では disabled も enabled も400になる）
+//          thinking パラメータは options.thinking を渡したときだけ付ける。それ以外（思考を見ない部屋・綴じ・編み）は一切付けない
+//            （思考が常時ONのモデルで disabled / enabled を送ると400になるため。adaptive + display: "summarized" だけを使う）。
+//            思考の表示用に保存した m.thinking は送らない（ここでは role と content だけを組み立てる）
 function buildRequestBody({ building, room, memories, retrospects, notes, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
   const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
@@ -1556,7 +1661,21 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   if (tools) body.tools = tools;
   if (tools && options.toolChoice) body.tool_choice = options.toolChoice;
   if (options.effort) body.output_config = { effort: options.effort };
+  if (options.thinking) body.thinking = { ...options.thinking };
   return body;
+}
+
+// 部屋設定の effort（不正値・おまかせは undefined）
+function roomEffort(room) {
+  return room && EFFORT_LEVELS.includes(room.effort) ? room.effort : undefined;
+}
+
+// 通常送信・編集＆再送信のリクエストの部屋ごとの指定（effort・出力上限・thinking）
+function sendOptionsFor(room) {
+  const effort = roomEffort(room);
+  const options = { effort, maxTokens: effort === "xhigh" || effort === "max" ? MAX_TOKENS_HIGH_EFFORT : MAX_TOKENS };
+  if (room && room.showThinking) options.thinking = SHOW_THINKING_PARAM;
+  return options;
 }
 
 // 履歴から thinking / redacted_thinking ブロックを取り除く
@@ -1880,6 +1999,14 @@ function RoomFormModal({ room, onCancel, onSave }) {
   const [webSearch, setWebSearch] = useState(room ? room.webSearch : false);
   const [jotNote, setJotNote] = useState(room ? !!room.jotNote : false);
   const [cacheTtl, setCacheTtl] = useState(room && room.cacheTtl === "1h" ? "1h" : "5m");
+  const [effort, setEffort] = useState(roomEffort(room) || ""); // "" はおまかせ
+  const [showThinking, setShowThinking] = useState(room ? !!room.showThinking : false);
+
+  function handleSave() {
+    const data = { name: name.trim(), systemPrompt, webSearch, jotNote, cacheTtl, showThinking };
+    if (effort) data.effort = effort; // おまかせのときはキーを持たない
+    onSave(data);
+  }
 
   return (
     <div className="overlay" onClick={onCancel}>
@@ -1934,12 +2061,39 @@ function RoomFormModal({ room, onCancel, onSave }) {
             <label htmlFor="cache-ttl-1h" style={{ margin: 0 }}>1時間 — 間をあけて話すとき（書き込み料金は2倍、読み出しは同じ）</label>
           </div>
         </div>
+        <div className="field">
+          <label>考える深さ（effort）</label>
+          <div className="toggle-row">
+            <input type="radio" name="effort" id="effort-auto" checked={effort === ""} onChange={() => setEffort("")} />
+            <label htmlFor="effort-auto" style={{ margin: 0 }}>
+              おまかせ<span className="field-note-inline">モデルの既定に任せる（Fable は high、Opus 5.5 は medium）</span>
+            </label>
+          </div>
+          <div className="effort-options">
+            {EFFORT_LEVELS.map((lv) => (
+              <div className="toggle-row" key={lv}>
+                <input type="radio" name="effort" id={`effort-${lv}`} checked={effort === lv} onChange={() => setEffort(lv)} />
+                <label htmlFor={`effort-${lv}`} style={{ margin: 0 }}>{lv}</label>
+              </div>
+            ))}
+          </div>
+          <div className="field-note">スレッドの途中で変えると、次の1通だけキャッシュの書き直しが起きる</div>
+        </div>
+        <div className="field toggle-row">
+          <input
+            type="checkbox"
+            id="showthinking-toggle"
+            checked={showThinking}
+            onChange={(e) => setShowThinking(e.target.checked)}
+          />
+          <label htmlFor="showthinking-toggle" style={{ margin: 0 }}>思考を見る</label>
+        </div>
         <div className="modal-actions">
           <button onClick={onCancel}>やめる</button>
           <button
             className="accent"
             disabled={!name.trim()}
-            onClick={() => onSave({ name: name.trim(), systemPrompt, webSearch, jotNote, cacheTtl })}
+            onClick={handleSave}
           >
             保存する
           </button>
@@ -2062,9 +2216,73 @@ function MessageContent({ content, markdown = false }) {
   );
 }
 
+/* ----- 思考 → Google翻訳（nagiChat と同じ方式） -----
+   基本は navigator.share で原文を共有シートに渡す（Google翻訳アプリはURLの text= を読まないため）。
+   navigator.share が無い環境ではURL方式にフォールバック。URLが長すぎると切れるので、
+   GTRANSLATE_MAX_CHARS を超える原文は「空行 → 改行 → 文末 → 空白」の切れ目で分割し、タップごとに順番に開く。
+   思考は日本語で返ることもあるので、原文の言語は自動判定（sl=auto）にする。 */
+const GTRANSLATE_MAX_CHARS = 2000;
+const GTRANSLATE_BASE = "https://translate.google.com/?sl=auto&tl=ja&op=translate&text=";
+
+function splitForTranslate(text, max) {
+  const src = text.trim();
+  if (src.length <= max) return [src];
+  const chunks = [];
+  let rest = src;
+  while (rest.length > max) {
+    const head = rest.slice(0, max);
+    // 後半寄りで最後の区切り（空行 > 改行 > 文末 > 空白）を探す。見つからなければ max 文字で強制カット
+    // 文末は英文の「. 」に加え、空白を挟まない和文の「。！？」も拾う
+    let cut = -1;
+    for (const re of [/\n\s*\n/g, /\n/g, /[.!?]\s|[。！？]/g, /\s/g]) {
+      let m, last = -1;
+      while ((m = re.exec(head))) last = m.index + m[0].length;
+      if (last > max * 0.5) { cut = last; break; }
+    }
+    if (cut <= 0) cut = max;
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+function openGoogleTranslate(text) {
+  window.open(GTRANSLATE_BASE + encodeURIComponent(text), "_blank", "noopener,noreferrer");
+}
+
+// 展開した思考の「翻訳」ボタン（思考を展開しているときだけ出す）
+function TranslateButton({ text }) {
+  const [chunkIdx, setChunkIdx] = useState(0); // 分割時、次に開くパート
+  const canShare = typeof navigator !== "undefined" && typeof navigator.share === "function";
+  const chunks = splitForTranslate(text, GTRANSLATE_MAX_CHARS);
+  const idx = chunkIdx % Math.max(chunks.length, 1);
+  const openNextChunk = () => {
+    openGoogleTranslate(chunks[idx]);
+    setChunkIdx((idx + 1) % chunks.length);
+  };
+  const handleTranslate = async () => {
+    if (!canShare) { openNextChunk(); return; }
+    try {
+      await navigator.share({ text });
+    } catch (e) {
+      if (e && e.name === "AbortError") return; // 共有シートを閉じただけ
+      console.warn("[書斎] 思考の共有に失敗したので URL 方式で開く", e);
+      openNextChunk();
+    }
+  };
+  return (
+    <button className="translate-btn" onClick={handleTranslate}>
+      {!canShare && chunks.length > 1 ? `翻訳 ${idx + 1}/${chunks.length}` : "翻訳"}
+    </button>
+  );
+}
+
 // モデル発言の下に出すキャッシュ状況の一行。usageの無い過去メッセージには何も出さない。
 // stopReason が end_turn 以外のときだけ、行頭にその値を添える。cost（messageCost の結果）があれば末尾に金額を添える。
-function UsageLine({ usage, stopReason, cost }) {
+// thinking（保存した思考の本文）があれば行末に「思考 ▸」を置き、タップでこの行の下に展開する（初期値は常に畳む。開閉は保存しない）
+function UsageLine({ usage, stopReason, cost, thinking }) {
+  const [thinkingOpen, setThinkingOpen] = useState(false);
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
   const read = usage.cache_read_input_tokens || 0;
@@ -2074,7 +2292,18 @@ function UsageLine({ usage, stopReason, cost }) {
     : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
   const prefix = stopReason && stopReason !== "end_turn" ? `${stopReason} ─ ` : "";
   const costText = !cost ? "" : cost.unpriced ? " ・ 単価未設定" : ` ・ ${formatUSD(cost.total)}`;
-  return <div className="usage-line">{prefix}{text}{costText}</div>;
+  const hasThinking = typeof thinking === "string" && thinking.trim() !== "";
+  if (!hasThinking) return <div className="usage-line">{prefix}{text}{costText}</div>;
+  return (
+    <>
+      <div className="usage-line usage-row">
+        <span>{prefix}{text}{costText}</span>
+        <button className="thinking-toggle" onClick={() => setThinkingOpen((v) => !v)}>思考 {thinkingOpen ? "▾" : "▸"}</button>
+        {thinkingOpen && <TranslateButton text={thinking} />}
+      </div>
+      {thinkingOpen && <div className="thinking-body">{thinking}</div>}
+    </>
+  );
 }
 
 // スレッドの支出の内訳（ヘッダーの金額をタップで開く）
@@ -2175,6 +2404,8 @@ function ConversationScreen({
   const [editText, setEditText] = useState("");
   const [confirmResend, setConfirmResend] = useState(null); // { index, count }
   const [streamText, setStreamText] = useState(""); // ストリーミング中の本文（保存前のプレーン表示用）
+  const [streamThinking, setStreamThinking] = useState(""); // ストリーミング中に流している思考（本文が届き始めたら消す）
+  const [sendNotice, setSendNotice] = useState(null); // 未対応の指定を外して送り直したときの知らせ。次の送信で消す
   const [showSpend, setShowSpend] = useState(false); // 支出の内訳を開いているか
   const [bundleNotice, setBundleNotice] = useState(null); // 綴じの完了メッセージ（usage と金額）。次の送信・綴じで消す
   const ttl = room.cacheTtl === "1h" ? "1h" : "5m";
@@ -2187,22 +2418,39 @@ function ConversationScreen({
   const jumpedRef = useRef(false); // ジャンプ後、次の送信まで「最下部へ」を抑える
   const streamedTsRef = useRef(null); // ストリーミング表示から切り替わった発言（フェードインを省き、ちらつかせない）
   const streamBufRef = useRef(""); // 届いた本文の全体。描画（マークダウン変換）は requestAnimationFrame で間引く
+  const thinkingBufRef = useRef(""); // いま流している思考（直近の本文以降に届いた分）
   const streamRafRef = useRef(null);
 
   function resetStream() {
     if (streamRafRef.current !== null) cancelAnimationFrame(streamRafRef.current);
     streamRafRef.current = null;
     streamBufRef.current = "";
+    thinkingBufRef.current = "";
     setStreamText("");
+    setStreamThinking("");
   }
 
-  function appendStream(t) {
-    streamBufRef.current += t;
+  function scheduleStreamRender() {
     if (streamRafRef.current !== null) return;
     streamRafRef.current = requestAnimationFrame(() => {
       streamRafRef.current = null;
       setStreamText(streamBufRef.current);
+      setStreamThinking(thinkingBufRef.current);
     });
+  }
+
+  // 本文が届き始めたら、流していた思考は画面から消す
+  function appendStream(t) {
+    streamBufRef.current += t;
+    thinkingBufRef.current = "";
+    scheduleStreamRender();
+  }
+
+  // 思考の文字。別の thinking ブロック（ツールを挟んだ次の周など）の始まりは空行で区切る
+  function appendThinking(t, firstOfBlock) {
+    if (firstOfBlock && thinkingBufRef.current) thinkingBufRef.current += "\n\n";
+    thinkingBufRef.current += t;
+    scheduleStreamRender();
   }
 
   useEffect(() => () => { if (streamRafRef.current !== null) cancelAnimationFrame(streamRafRef.current); }, []);
@@ -2239,18 +2487,19 @@ function ConversationScreen({
   }, []);
 
   useEffect(() => {
-    if (!streamText) { autoScrollYRef.current = null; return; }
+    if (!streamText && !streamThinking) { autoScrollYRef.current = null; return; }
     // scroll イベントより先に次の文字が届いた場合に備え、前回の追尾位置より上にいれば追尾を止める
     if (autoScrollYRef.current !== null && window.scrollY < autoScrollYRef.current - 2) followRef.current = false;
     if (!followRef.current) return;
     scrollToBottom();
     autoScrollYRef.current = window.scrollY;
-  }, [streamText]);
+  }, [streamText, streamThinking]);
 
   // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
   async function sendToModel(nextMessages) {
     setError(null);
     setBundleNotice(null);
+    setSendNotice(null);
     jumpedRef.current = false;
     jumpPendingRef.current = false;
     followRef.current = true;
@@ -2264,12 +2513,19 @@ function ConversationScreen({
     try {
       // block2 は据え置き（resolveBlock2）。ツールループの各周は同じ body を使うので、ターン内でも変わらない
       const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
-      const body = buildRequestBody({ building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages, { block2Text });
+      // 部屋ごとの指定：effort（おまかせなら付けない）・出力上限・「思考を見る」部屋だけ thinking
+      const body = buildRequestBody(
+        { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages,
+        { block2Text, ...sendOptionsFor(room) },
+      );
       let json;
       try {
-        json = await callModelWithContinuation({
-          building, apiKey, body, onDelta: appendStream, onRound: (r) => spentRounds.push(r),
+        // 未対応の指定（effort・thinking・出力上限）で 400 になったら、その指定だけ外して1回送り直し、知らせる
+        const r = await callModelWithParamFallback({
+          building, apiKey, body, onDelta: appendStream, onThinkingDelta: appendThinking, onRound: (r) => spentRounds.push(r),
         });
+        json = r.json;
+        if (r.notices.length > 0) setSendNotice(r.notices.join("\n"));
       } catch (e) {
         // 途中で失敗しても、それまでに書き付けられた手控えは残す
         if (e.jotted) onAddNotes(e.jotted);
@@ -2312,6 +2568,9 @@ function ConversationScreen({
       if (json.model) assistantMessage.model = json.model;
       if (json.rounds && json.rounds.length > 1) assistantMessage.rounds = json.rounds;
       if (jotted.length > 0) assistantMessage.jotted = jotted;
+      // 思考（全周の thinking ブロックの本文）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）。
+      // content の thinking ブロック自体は上のとおり保存しない
+      if (json.thinking) assistantMessage.thinking = json.thinking;
       saved = true;
       jumpPendingRef.current = true;
       streamedTsRef.current = assistantMessage.ts;
@@ -2466,16 +2725,17 @@ function ConversationScreen({
               </div>
             )}
             {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
-            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} cost={messageCost(m, building.model, ttl, priceTable)} />}
+            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} cost={messageCost(m, building.model, ttl, priceTable)} thinking={m.thinking} />}
           </div>
           </React.Fragment>
           );
         })}
-        {sending && (
-          streamText
-            ? <div className="msg msg-model"><MarkdownText text={streamText} /></div>
-            : <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>
-        )}
+        {sending && streamText && <div className="msg msg-model"><MarkdownText text={streamText} /></div>}
+        {/* 思考は「（考えている）」の位置に流す。ツールを挟んで後の周で届いた思考は、本文の下に同じ見た目で流す */}
+        {sending && (streamThinking
+          ? <div className="msg stream-thinking">{streamThinking}</div>
+          : !streamText && <div className="msg msg-loading">{room.webSearch ? "（調べている）" : "（考えている）"}</div>)}
+        {!sending && sendNotice && <div className="usage-line spend-notice">{sendNotice}</div>}
         {bundling && <div className="msg msg-loading">（記憶を綴じている）</div>}
         {!bundling && bundleNotice && <div className="usage-line spend-notice">{bundleNotice}</div>}
         <div ref={bottomRef} />
@@ -3312,7 +3572,7 @@ function App() {
           setRetrospects({ ...retrospects, [room.id]: { text, updatedAt: nowISO() } });
           invalidateBlock2(room.id); // 編んだ回想録を次の送信から block2 に入れる
           // 完了メッセージ（usage と金額。自動再試行があれば全試行の合計）
-          return spendNoticeText("編みました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable);
+          return [spendNoticeText("編みました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable), ...json.fallbackNotices].join("\n");
         }}
       />
     );
@@ -3379,7 +3639,7 @@ function App() {
           setMemories([...memories, memory]);
           invalidateBlock2(room.id); // 綴じた記録を次の送信から block2 に入れる
           // 完了メッセージ（usage と金額。自動再試行があれば全試行の合計）
-          return spendNoticeText("綴じました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable);
+          return [spendNoticeText("綴じました", json.allRounds, json.retries, room.cacheTtl === "1h" ? "1h" : "5m", priceTable), ...json.fallbackNotices].join("\n");
         }}
       />
     );
@@ -3432,7 +3692,12 @@ function App() {
           setRooms([...rooms, newRoom]);
         }}
         onEditRoom={(roomId, data) => {
-          setRooms(rooms.map((r) => (r.id === roomId ? { ...r, ...data } : r)));
+          setRooms(rooms.map((r) => {
+            if (r.id !== roomId) return r;
+            // おまかせ（effort を持たない）に戻したら、キーごと外す
+            const { effort, ...rest } = r;
+            return { ...rest, ...data };
+          }));
         }}
         onDeleteRoom={(roomId) => {
           setRooms(rooms.filter((r) => r.id !== roomId));
