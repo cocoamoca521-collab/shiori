@@ -1459,16 +1459,22 @@ async function callModelRetryOnEmpty(args, onJotted) {
 //          / block1Only（system をブロック1だけにする。「回想録を編む」用）
 //          / effort（output_config.effort。綴じ・編みだけが "low" を渡す。通常送信には付けない）
 //          / block2Text（block2 の本文。resolveBlock2 で据え置いたものを渡す。省略時はその場で組み立てる）
+//          / noCache（cache_control を一切付けない。綴じ・編みだけが true を渡す）
+//            綴じ・編みは tool_choice（none）と effort（low）が通常送信と違うため会話部分のキャッシュに当たらず、
+//            綴じ・編みのあとは block2 も作り直されるので、ここで書き込んだキャッシュは二度と読まれない。
+//            書き込み料金（1時間TTLなら入力の2倍）が丸損になるので、ブレークポイントを置かない。
+//            （ブレークポイントが無いと system のキャッシュも読めず、その分は通常の入力単価になる）
 //          thinking パラメータは一切送らない（Opus 5.5 等では disabled も enabled も400になる）
 function buildRequestBody({ building, room, memories, retrospects, notes, frozenDate }, messagesToSend, options = {}) {
   // 1リクエスト内のブレークポイントは全て同一TTLに揃える（block1・block2・履歴の最終メッセージの計3つ）
   const ttl = room.cacheTtl === "1h" ? "1h" : undefined; // "5m"時はttl省略（API既定が5分）
   const cc = ttl ? { type: "ephemeral", ttl } : { type: "ephemeral" };
-  const block1 = { type: "text", text: room.systemPrompt, cache_control: cc };
+  const noCache = !!options.noCache;
+  const block1 = noCache ? { type: "text", text: room.systemPrompt } : { type: "text", text: room.systemPrompt, cache_control: cc };
   const system = [block1];
   if (!options.block1Only) {
     const block2Text = typeof options.block2Text === "string" ? options.block2Text : buildBlock2(room, memories, retrospects, notes, frozenDate);
-    system.push({ type: "text", text: block2Text, cache_control: cc });
+    system.push(noCache ? { type: "text", text: block2Text } : { type: "text", text: block2Text, cache_control: cc });
   }
   // tools の構成は部屋設定だけで決まる（通常送信・綴じ・編むで一致させ、キャッシュのプレフィックスを揃える）
   const toolList = [];
@@ -1488,7 +1494,7 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   // 保存した tool_use / tool_result を API の形に展開する。jot_note を tools に送らない部屋では除去して前後の本文を結合する
   const expanded = mergeSameRoleMessages(sendable.flatMap((m) => (m.role === "assistant" ? expandToolTurns(m, !!room.jotNote) : [m])));
   const payloadMessages = expanded.map((m, i) => {
-    if (i !== expanded.length - 1) {
+    if (i !== expanded.length - 1 || noCache) {
       return { role: m.role, content: m.content };
     }
     // 履歴の最後のメッセージにキャッシュ境界を置く。保存形式は変えない。
@@ -1556,8 +1562,9 @@ function cacheTtlMs(room) {
   return room.cacheTtl === "1h" ? 60 * 60 * 1000 : 5 * 60 * 1000;
 }
 
-// このスレッドで送る block2 を返し、送信時刻を控えに記録する
-function resolveBlock2({ room, thread, memories, retrospects, notes }) {
+// このスレッドで送る block2 を返し、送信時刻を控えに記録する。
+// touch: false（綴じ）のときは控えを読むだけで、何も書き換えない（キャッシュを使わないリクエストで TTL の起点を動かさない）
+function resolveBlock2({ room, thread, memories, retrospects, notes, touch = true }) {
   const snaps = loadJSON(K.block2Snapshots, {});
   const snap = snaps[thread.id];
   const now = Date.now();
@@ -1565,6 +1572,7 @@ function resolveBlock2({ room, thread, memories, retrospects, notes }) {
   if (!snap || snap.roomId !== room.id || typeof snap.text !== "string") reason = "控えなし（新しいスレッド・作り直し後）";
   else if (!(now - new Date(snap.lastSentAt).getTime() < cacheTtlMs(room))) reason = "TTL 経過";
   const text = reason ? buildBlock2(room, memories, retrospects, notes, thread.frozenDate) : snap.text;
+  if (!touch) return text;
   if (reason) console.log(`[書斎] block2 を作り直した（${reason}）`);
   else console.log("[書斎] block2 は前回送ったものをそのまま使う");
   snaps[thread.id] = { roomId: room.id, text, lastSentAt: new Date(now).toISOString() };
@@ -3199,6 +3207,7 @@ function App() {
               toolChoice: { type: "none" },
               effort: "low", // 思考の中で書き終えて本文が空になるのを防ぐ
               block1Only: true,
+              noCache: true, // 編みのキャッシュ書き込みは二度と読まれないので付けない（buildRequestBody の noCache を参照）
               extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
             },
           );
@@ -3251,15 +3260,16 @@ function App() {
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id, threadId: thread.id })}
         onOpenBundleMemory={async () => {
           // 棟のモデル本人が、会話の続きとして自分で綴じる。
-          // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
+          // 通常送信と同じ buildRequestBody を通すが、cache_control は付けない（noCache）。
           // 綴じ指示と応答は thread.messages に保存しない。
-          // block2 も通常送信と同じ据え置きのものを使い、プレフィックスを一致させる
-          const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
+          // block2 は、モデルが会話中に見ていたものと同じ据え置きの本文を使う。キャッシュに触れないので送信時刻は控えない（touch: false）
+          const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes, touch: false });
           const body = buildRequestBody(
             { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate },
             thread.messages,
             {
               block2Text,
+              noCache: true, // 綴じのキャッシュ書き込みは二度と読まれないので付けない（buildRequestBody の noCache を参照）
               maxTokens: BUNDLE_MAX_TOKENS,
               toolChoice: { type: "none" }, // tools は外さず、検索の実行だけを封じる
               effort: "low", // 思考の中で書き終えて本文が空になるのを防ぐ
