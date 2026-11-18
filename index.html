@@ -1012,6 +1012,8 @@ const DEFAULT_PRICE_TABLE = [
     over: { threshold: 100000, rates: { input: 0.5, write5m: 0.625, write1h: 1, read: 0.05, output: 2.5 } },
   },
   { key: "haiku-4-5", label: "Haiku 4.5", ids: ["claude-haiku-4-5"], rates: { input: 1, write5m: 1.25, write1h: 2, read: 0.1, output: 5 } },
+  // モデルによらない項目。usage.server_tool_use.web_search_requests の回数 × (perThousand / 1000)。ids を持たないのでモデルの照合には使われない
+  { key: "web-search", label: "Web検索（1,000回あたり）", webSearch: true, perThousand: 10 },
 ];
 const PRICE_FIELDS = [
   { k: "input", label: "入力" },
@@ -1047,13 +1049,27 @@ function loadPriceTable() {
   const stored = loadJSON(K.prices, null);
   if (!Array.isArray(stored)) return DEFAULT_PRICE_TABLE;
   const keys = new Set(stored.map((r) => r && r.key));
-  return [...stored.filter((r) => r && r.rates), ...DEFAULT_PRICE_TABLE.filter((r) => !keys.has(r.key))];
+  return [...stored.filter((r) => r && (r.rates || r.webSearch)), ...DEFAULT_PRICE_TABLE.filter((r) => !keys.has(r.key))];
 }
 
 function findPriceRow(model, table) {
   const id = normalizeModelId(model);
   if (!id) return null;
-  return table.find((r) => (r.ids || []).some((x) => normalizeModelId(x) === id)) || null;
+  return table.find((r) => r.rates && (r.ids || []).some((x) => normalizeModelId(x) === id)) || null;
+}
+
+// Web検索の回数（そのリクエストで実行されたサーバー側検索）
+function webSearchCount(usage) {
+  const st = usage && usage.server_tool_use;
+  const v = st && typeof st === "object" ? st.web_search_requests : 0;
+  return typeof v === "number" && isFinite(v) && v > 0 ? v : 0;
+}
+
+// Web検索1回あたりの単価（USD）
+function webSearchUnitPrice(table) {
+  const row = table.find((r) => r.webSearch);
+  const v = row ? Number(row.perThousand) : 0;
+  return isFinite(v) && v > 0 ? v / 1000 : 0;
 }
 
 // 1回のリクエストの金額（USD）。単価表に無いモデルなら null
@@ -1080,8 +1096,10 @@ function requestCost(usage, model, ttl, table) {
     write: (w5 * r("write5m") + w1 * r("write1h")) / 1e6,
     read: (read * r("read")) / 1e6,
     output: (out * r("output")) / 1e6,
+    webSearch: webSearchCount(usage) * webSearchUnitPrice(table),
   };
-  c.total = c.input + c.write + c.read + c.output;
+  c.searches = webSearchCount(usage);
+  c.total = c.input + c.write + c.read + c.output + c.webSearch;
   return c;
 }
 
@@ -1120,7 +1138,7 @@ function ledgerFromMessages(thread, fallbackModel) {
 
 // 帳簿の集計。合計・種別ごと・項目ごと・未計上の件数とモデル・古い発言の注記の要否
 function summarizeLedger(entries, ttl, table) {
-  const sum = { total: 0, byKind: {}, byCat: { input: 0, write: 0, read: 0, output: 0 }, counts: {}, unpriced: 0, unpricedModels: [], legacyZeroWrite: false };
+  const sum = { total: 0, byKind: {}, byCat: { input: 0, write: 0, read: 0, output: 0, webSearch: 0 }, counts: {}, searches: 0, unpriced: 0, unpricedModels: [], legacyZeroWrite: false };
   SPEND_KINDS.forEach(({ k }) => { sum.byKind[k] = 0; sum.counts[k] = 0; });
   (entries || []).forEach((e) => {
     if (!e || !e.usage) return;
@@ -1135,6 +1153,7 @@ function summarizeLedger(entries, ttl, table) {
       return;
     }
     sum.total += c.total;
+    sum.searches += c.searches;
     sum.byKind[kind] += c.total;
     Object.keys(sum.byCat).forEach((k) => { sum.byCat[k] += c[k]; });
   });
@@ -2036,6 +2055,7 @@ function SpendBreakdownDialog({ title, summary, onClose }) {
         {row("書き込み", summary.byCat.write)}
         {row("読み", summary.byCat.read)}
         {row("出力", summary.byCat.output)}
+        {summary.searches > 0 && row("Web検索", summary.byCat.webSearch, `${summary.searches}回`)}
         {summary.unpriced > 0 && (
           <div className="spend-note">
             単価未設定のモデル（{summary.unpricedModels.join("、")}）の {summary.unpriced} 回分は計上していない。設定の「料金単価」から単価を追加できる。
@@ -2621,6 +2641,7 @@ function PriceTableEditor({ table, unpricedModels, onChange, onReset }) {
     if (text.trim() === "" || !isFinite(v) || v < 0) return false;
     onChange(table.map((r) => {
       if (r.key !== rowKey) return r;
+      if (r.webSearch) return { ...r, perThousand: v };
       if (tier === "over") return { ...r, over: { ...r.over, rates: { ...r.over.rates, [field]: v } } };
       return { ...r, rates: { ...r.rates, [field]: v } };
     }));
@@ -2655,9 +2676,24 @@ function PriceTableEditor({ table, unpricedModels, onChange, onReset }) {
     <div className="settings-block">
       <h2>料金単価</h2>
       <div className="usage-line" style={{ marginTop: 0, marginBottom: 6 }}>
-        USD ／ 100万トークン。スレッドの概算金額の計算に使う（表示だけで、送る内容には影響しない）。
+        USD ／ 100万トークン（Web検索は1,000回あたり）。スレッドの概算金額の計算に使う（表示だけで、送る内容には影響しない）。
       </div>
-      {table.map((row) => (
+      {table.filter((row) => row.webSearch).map((row) => (
+        <div className="price-row" key={`${version}-${row.key}`}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <span>{row.label}<span className="usage-line" style={{ marginLeft: 8 }}>どのモデルでも共通</span></span>
+            <input
+              type="text"
+              inputMode="decimal"
+              style={{ width: 90, padding: "6px 6px", fontSize: 13, borderRadius: 8 }}
+              defaultValue={String(row.perThousand)}
+              onChange={(e) => setRate(row.key, "base", "perThousand", e.target.value)}
+              onBlur={(e) => { if (!setRate(row.key, "base", "perThousand", e.target.value)) setVersion((n) => n + 1); }}
+            />
+          </div>
+        </div>
+      ))}
+      {table.filter((row) => row.rates).map((row) => (
         <div className="price-row" key={`${version}-${row.key}`}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
             <span>{row.label}</span>
