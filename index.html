@@ -252,6 +252,15 @@
   .md del { color: var(--muted); }
   .citations { margin-top: 8px; font-size: 12px; display: flex; flex-direction: column; gap: 4px; }
   .citations a { color: var(--accent-text); }
+  .thread-cost { margin-left: 10px; font-size: 11px; color: var(--faint); cursor: pointer; font-family: "Zen Kaku Gothic New", sans-serif; letter-spacing: 0.02em; white-space: nowrap; }
+  .thread-cost:hover { color: var(--accent-text); }
+  .spend-head { color: var(--muted); font-size: 12px; margin-top: 16px; }
+  .spend-note { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.7; }
+  .price-row { border-bottom: 1px solid var(--rule); padding: 12px 0; }
+  .price-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-top: 6px; }
+  .price-grid label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .price-grid input { padding: 6px 6px; font-size: 13px; border-radius: 8px; }
+  @media (max-width: 480px) { .price-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .usage-line { color: var(--faint); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
   .jotted-line { color: var(--jot); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; line-height: 1.6; }
   .jotted-line + .jotted-line { margin-top: 2px; }
@@ -363,6 +372,10 @@ const K = {
   lastThreadId: "shosai_last_thread_id",
   // スレッドごとに「前回送った block2（記録帳・回想録・手控え欄）」を控える。バックアップには含めない
   block2Snapshots: "shosai_block2_snapshots",
+  // 支出の帳簿 { threads: { threadId: [記録] }, rooms: { roomId: [記録] } }。記録は { ts, kind, model, usage }。バックアップに含める
+  ledgers: "shosai_ledgers",
+  // 料金単価（設定画面で編集したときだけ保存。無ければ組み込みの初期値）
+  prices: "shosai_prices",
 };
 
 const WEB_SEARCH_MAX_USES = 3;
@@ -644,7 +657,9 @@ function isValidBackup(data) {
     && Array.isArray(data.buildings) && Array.isArray(data.rooms)
     && Array.isArray(data.threads) && Array.isArray(data.memories)
     // 手控えキーの無い旧バックアップも有効（復元時に [] 扱い）
-    && (data.notes === undefined || Array.isArray(data.notes));
+    && (data.notes === undefined || Array.isArray(data.notes))
+    // 帳簿・料金単価の無い旧バックアップも有効（帳簿はスレッドを開いたときに発言から作り直す）
+    && (data.ledgers === undefined || (!!data.ledgers && typeof data.ledgers === "object"));
 }
 
 // 手控えの本文を整える。120字超は先頭120字で切り詰める（エラーにはしない）。
@@ -978,12 +993,186 @@ function cacheWriteTokens(usage) {
   return total > 0 ? total : breakdown;
 }
 
+/* ----- 概算金額（表示専用。API に送る内容・キャッシュには一切関わらない） -----
+   単価は USD / 100万トークン。rates = { input, write5m, write1h, read, output }。
+   over があるモデル（Haiku 5.5）は、1リクエストの入力合計（素＋書＋読）が threshold を超えたら、そのリクエスト全体を over.rates で計算する。
+   ids は正規化（normalizeModelId）したモデルIDで照合する。日付付きID・ドット表記などの表記ゆれは正規化で同じ行に寄る。 */
+const DEFAULT_PRICE_TABLE = [
+  { key: "fable-5-2", label: "Fable 5.2 / Mythos 5.2", ids: ["claude-fable-5-2", "claude-mythos-5-2"], rates: { input: 8, write5m: 10, write1h: 16, read: 0.2, output: 40 } },
+  { key: "fable-5-1", label: "Fable 5.1 / Mythos 5.1", ids: ["claude-fable-5-1", "claude-mythos-5-1"], rates: { input: 10, write5m: 12.5, write1h: 20, read: 0.25, output: 50 } },
+  { key: "fable-5", label: "Fable 5 / Mythos 5", ids: ["claude-fable-5", "claude-mythos-5"], rates: { input: 10, write5m: 12.5, write1h: 20, read: 1, output: 50 } },
+  { key: "opus-5-5", label: "Opus 5.5", ids: ["claude-opus-5-5"], rates: { input: 4, write5m: 5, write1h: 8, read: 0.2, output: 20 } },
+  { key: "opus-5", label: "Opus 5 / Opus 4.5〜4.8", ids: ["claude-opus-5", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"], rates: { input: 5, write5m: 6.25, write1h: 10, read: 0.5, output: 25 } },
+  { key: "sonnet-5-5", label: "Sonnet 5.5", ids: ["claude-sonnet-5-5"], rates: { input: 2, write5m: 2.5, write1h: 4, read: 0.1, output: 10 } },
+  { key: "sonnet-5", label: "Sonnet 5", ids: ["claude-sonnet-5"], rates: { input: 2, write5m: 2.5, write1h: 4, read: 0.2, output: 10 } },
+  { key: "sonnet-4-5", label: "Sonnet 4.5 / 4.6", ids: ["claude-sonnet-4-5", "claude-sonnet-4-6"], rates: { input: 3, write5m: 3.75, write1h: 6, read: 0.3, output: 15 } },
+  {
+    key: "haiku-5-5", label: "Haiku 5.5", ids: ["claude-haiku-5-5"],
+    rates: { input: 0.1, write5m: 0.125, write1h: 0.2, read: 0.01, output: 0.5 },
+    over: { threshold: 100000, rates: { input: 0.5, write5m: 0.625, write1h: 1, read: 0.05, output: 2.5 } },
+  },
+  { key: "haiku-4-5", label: "Haiku 4.5", ids: ["claude-haiku-4-5"], rates: { input: 1, write5m: 1.25, write1h: 2, read: 0.1, output: 5 } },
+  // モデルによらない項目。usage.server_tool_use.web_search_requests の回数 × (perThousand / 1000)。ids を持たないのでモデルの照合には使われない
+  { key: "web-search", label: "Web検索（1,000回あたり）", webSearch: true, perThousand: 10 },
+];
+const PRICE_FIELDS = [
+  { k: "input", label: "入力" },
+  { k: "write5m", label: "5分書き込み" },
+  { k: "write1h", label: "1時間書き込み" },
+  { k: "read", label: "キャッシュ読み" },
+  { k: "output", label: "出力" },
+];
+// 「書」が 0 で記録されていた不具合（message_delta の 0 で上書き）の修正より前の発言。帳簿の注記にだけ使う
+const USAGE_WRITE_FIX_AT = "2026-11-18T00:00:00Z";
+const SPEND_KINDS = [
+  { k: "send", label: "通常送信" },
+  { k: "bundle", label: "綴じ" },
+  { k: "weave", label: "編み" },
+  { k: "discard", label: "破棄" },
+];
+const EMPTY_LEDGERS = { threads: {}, rooms: {} };
+
+// モデルIDの表記ゆれを寄せる：大文字小文字・[1m] 等の添え字・プロバイダ接頭辞・日付／版の接尾辞・数字間のドット
+function normalizeModelId(id) {
+  let s = String(id || "").trim().toLowerCase();
+  s = s.replace(/\[[^\]]*\]$/, "");
+  s = s.replace(/^(?:(?:us|eu|apac|global|jp|au)\.)?(?:anthropic[./])?/, "");
+  s = s.replace(/^models\//, "");
+  s = s.replace(/(\d)\.(\d)/g, "$1-$2");
+  s = s.replace(/(?:[-@]\d{8})?(?:-v\d+(?::\d+)?)?$/, "");
+  s = s.replace(/-latest$/, "");
+  return s;
+}
+
+// 保存されている単価表を読み込む。初期値に後から足された行（key で判定）は末尾に補う
+function loadPriceTable() {
+  const stored = loadJSON(K.prices, null);
+  if (!Array.isArray(stored)) return DEFAULT_PRICE_TABLE;
+  const keys = new Set(stored.map((r) => r && r.key));
+  return [...stored.filter((r) => r && (r.rates || r.webSearch)), ...DEFAULT_PRICE_TABLE.filter((r) => !keys.has(r.key))];
+}
+
+function findPriceRow(model, table) {
+  const id = normalizeModelId(model);
+  if (!id) return null;
+  return table.find((r) => r.rates && (r.ids || []).some((x) => normalizeModelId(x) === id)) || null;
+}
+
+// Web検索の回数（そのリクエストで実行されたサーバー側検索）
+function webSearchCount(usage) {
+  const st = usage && usage.server_tool_use;
+  const v = st && typeof st === "object" ? st.web_search_requests : 0;
+  return typeof v === "number" && isFinite(v) && v > 0 ? v : 0;
+}
+
+// Web検索1回あたりの単価（USD）
+function webSearchUnitPrice(table) {
+  const row = table.find((r) => r.webSearch);
+  const v = row ? Number(row.perThousand) : 0;
+  return isFinite(v) && v > 0 ? v / 1000 : 0;
+}
+
+// 1回のリクエストの金額（USD）。単価表に無いモデルなら null
+function requestCost(usage, model, ttl, table) {
+  if (!usage) return null;
+  const row = findPriceRow(model, table);
+  if (!row) return null;
+  const n = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
+  const raw = n(usage.input_tokens);
+  const read = n(usage.cache_read_input_tokens);
+  const out = n(usage.output_tokens); // 思考トークンも含まれる
+  const cc = usage.cache_creation && typeof usage.cache_creation === "object" ? usage.cache_creation : {};
+  let w5 = n(cc.ephemeral_5m_input_tokens);
+  let w1 = n(cc.ephemeral_1h_input_tokens);
+  const write = cacheWriteTokens(usage);
+  // 内訳が無い（足りない）分は、その部屋の TTL 設定のほうに入れる
+  if (w5 + w1 < write) {
+    if (ttl === "1h") w1 += write - w5 - w1; else w5 += write - w5 - w1;
+  }
+  const rates = row.over && raw + w5 + w1 + read > row.over.threshold ? row.over.rates : row.rates;
+  const r = (k) => n(Number(rates[k]));
+  const c = {
+    input: (raw * r("input")) / 1e6,
+    write: (w5 * r("write5m") + w1 * r("write1h")) / 1e6,
+    read: (read * r("read")) / 1e6,
+    output: (out * r("output")) / 1e6,
+    webSearch: webSearchCount(usage) * webSearchUnitPrice(table),
+  };
+  c.searches = webSearchCount(usage);
+  c.total = c.input + c.write + c.read + c.output + c.webSearch;
+  return c;
+}
+
+// 発言1件の金額。複数回リクエストしたターン（rounds）は各回を個別に計算して足す。
+// どれか1回でも単価未設定なら { unpriced: true }（金額は計上しない）。usage の無い古い発言は null
+function messageCost(m, fallbackModel, ttl, table) {
+  if (!m || !m.usage) return null;
+  const rounds = Array.isArray(m.rounds) && m.rounds.length > 0 ? m.rounds : [{ model: m.model, usage: m.usage }];
+  let total = 0;
+  for (const r of rounds) {
+    const c = requestCost(r.usage, r.model || m.model || fallbackModel, ttl, table);
+    if (!c) return { unpriced: true };
+    total += c.total;
+  }
+  return { total };
+}
+
+function formatUSD(x) {
+  const v = typeof x === "number" && isFinite(x) ? x : 0;
+  return `$${v < 1 ? v.toFixed(4) : v.toFixed(2)}`;
+}
+
+// 保存済みの発言の usage から帳簿を作る（帳簿の無い既存スレッドを初めて開いたときに一度だけ）。
+// モデルは発言に保存されていればそれ、無ければその時点の棟のモデルで代用して記録する
+function ledgerFromMessages(thread, fallbackModel) {
+  const entries = [];
+  (thread.messages || []).forEach((m) => {
+    if (!m || m.role !== "assistant" || !m.usage) return;
+    const rounds = Array.isArray(m.rounds) && m.rounds.length > 0 ? m.rounds : [{ model: m.model, usage: m.usage }];
+    rounds.forEach((r) => entries.push({
+      ts: hasMsgTime(m) ? m.ts : null, kind: "send", model: r.model || m.model || fallbackModel || null, usage: r.usage, fromHistory: true,
+    }));
+  });
+  return entries;
+}
+
+// 帳簿の集計。合計・種別ごと・項目ごと・未計上の件数とモデル・古い発言の注記の要否
+function summarizeLedger(entries, ttl, table) {
+  const sum = { total: 0, byKind: {}, byCat: { input: 0, write: 0, read: 0, output: 0, webSearch: 0 }, counts: {}, searches: 0, unpriced: 0, unpricedModels: [], legacyZeroWrite: false };
+  SPEND_KINDS.forEach(({ k }) => { sum.byKind[k] = 0; sum.counts[k] = 0; });
+  (entries || []).forEach((e) => {
+    if (!e || !e.usage) return;
+    const kind = sum.byKind[e.kind] !== undefined ? e.kind : "send";
+    sum.counts[kind]++;
+    if (e.fromHistory && cacheWriteTokens(e.usage) === 0 && (!e.ts || e.ts < USAGE_WRITE_FIX_AT)) sum.legacyZeroWrite = true;
+    const c = requestCost(e.usage, e.model, ttl, table);
+    if (!c) {
+      sum.unpriced++;
+      const id = e.model || "（モデル不明）";
+      if (!sum.unpricedModels.includes(id)) sum.unpricedModels.push(id);
+      return;
+    }
+    sum.total += c.total;
+    sum.searches += c.searches;
+    sum.byKind[kind] += c.total;
+    Object.keys(sum.byCat).forEach((k) => { sum.byCat[k] += c[k]; });
+  });
+  return sum;
+}
+
+function normalizeLedgers(data) {
+  const ok = (o) => (o && typeof o === "object" && !Array.isArray(o) ? o : {});
+  const src = ok(data);
+  return { threads: { ...ok(src.threads) }, rooms: { ...ok(src.rooms) } };
+}
+
 // SSE（stream: true）を読み、非ストリーミング時と同じ形の { content, stop_reason, usage } を組み立てる。
 // text_delta のフラグメントだけを onDelta に流す。途中で切れた・壊れた場合は ShosaiError（部分出力は返さない）。
 async function readAnthropicStream(res, onDelta) {
   const content = [];
   const partialJson = {}; // index → 連結中の input_json_delta
   let usage = {};
+  let model = null; // 応答したモデル（金額の計算用）
   let stopReason = null;
   let finished = false;
 
@@ -993,6 +1182,7 @@ async function readAnthropicStream(res, onDelta) {
         // 調査用：届いた usage をそのまま出す（「書」がどのフィールドから来るかの確認）
         console.log("[書斎] raw usage message_start", JSON.stringify((data.message && data.message.usage) || null));
         usage = mergeUsage({}, (data.message && data.message.usage) || {});
+        if (data.message && data.message.model) model = data.message.model;
         break;
       case "content_block_start": {
         const block = { ...data.content_block };
@@ -1086,7 +1276,7 @@ async function readAnthropicStream(res, onDelta) {
   if (!finished) {
     throw new ShosaiError(STREAM_BROKEN_MESSAGE, { raw: "message_stop を受け取る前にストリームが終わった" });
   }
-  return { content: content.filter(Boolean), stop_reason: stopReason, usage };
+  return { content: content.filter(Boolean), stop_reason: stopReason, usage, model };
 }
 
 // Anthropic Messages APIをブラウザから直接呼ぶ唯一の窓口
@@ -1156,8 +1346,11 @@ function runClientTool(block, jotted) {
 // 全周回の content を順に連結して返す。usage は全周回の合計（sumUsage）、stop_reason は最終周のもの。jotted はこの送信中に書き付けられた本文の配列。
 // 途中でエラーになった場合も、それまでの jotted を error.jotted に載せて投げ直す（記憶は記憶として残すため）。
 // onDelta（任意）は各周回にそのまま渡す。tool_use を挟んだ続きは空行を1つ挟んで同じ流れとして文字が増えていく。
-async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
+// onRound（任意）は usage が返ってきた周ごとに { model, usage } で呼ぶ（支出の帳簿用。途中でエラーになっても、それまでの周は呼ばれている）。
+// rounds は全周の { model, usage }（各回を個別に金額計算するため）、model は最終周を返したモデル。
+async function callModelWithContinuation({ building, apiKey, body, onDelta, onRound }) {
   const content = [];
+  const rounds = [];
   const jotted = [];
   let json;
   let totalUsage = null;
@@ -1180,6 +1373,13 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
       console.log(`[書斎] round ${round} stop_reason`, json.stop_reason, json.usage);
       // 各周の「書」を先に確定させてから足す（周ごとに cache_creation_input_tokens の有無が違っても取りこぼさない）
       if (json.usage) totalUsage = sumUsage(totalUsage, { ...json.usage, cache_creation_input_tokens: cacheWriteTokens(json.usage) });
+      if (json.usage) {
+        const r = { model: json.model || body.model, usage: json.usage };
+        rounds.push(r);
+        if (typeof onRound === "function") {
+          try { onRound(r); } catch (err) { console.warn("[書斎] 支出の記録に失敗", err); }
+        }
+      }
       const roundContent = json.content || [];
       content.push(...roundContent);
       // 再送用：空の text ブロックはAPIに弾かれるので落とす。thinking 等はそのまま（除去するとAPIエラー）
@@ -1221,7 +1421,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta }) {
     if (jotted.length > 0) e.jotted = jotted;
     throw e;
   }
-  return { content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated };
+  return { content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, rounds, model: json.model || body.model };
 }
 
 // 「記憶を綴じる」「回想録を編む」用：可視テキストが無ければ自動で1回だけ再試行する。
@@ -1818,8 +2018,8 @@ function MessageContent({ content, markdown = false }) {
 }
 
 // モデル発言の下に出すキャッシュ状況の一行。usageの無い過去メッセージには何も出さない。
-// stopReason が end_turn 以外のときだけ、行頭にその値を添える。
-function UsageLine({ usage, stopReason }) {
+// stopReason が end_turn 以外のときだけ、行頭にその値を添える。cost（messageCost の結果）があれば末尾に金額を添える。
+function UsageLine({ usage, stopReason, cost }) {
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
   const read = usage.cache_read_input_tokens || 0;
@@ -1828,7 +2028,49 @@ function UsageLine({ usage, stopReason }) {
     ? `栞 ─ 読 ${fmt(read)} ・ 書 ${fmt(created)} ・ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`
     : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
   const prefix = stopReason && stopReason !== "end_turn" ? `${stopReason} ─ ` : "";
-  return <div className="usage-line">{prefix}{text}</div>;
+  const costText = !cost ? "" : cost.unpriced ? " ・ 単価未設定" : ` ・ ${formatUSD(cost.total)}`;
+  return <div className="usage-line">{prefix}{text}{costText}</div>;
+}
+
+// スレッドの支出の内訳（ヘッダーの金額をタップで開く）
+function SpendBreakdownDialog({ title, summary, onClose }) {
+  const row = (label, value, note) => (
+    <div className="kv-row" style={{ padding: "6px 0" }}>
+      <span>{label}{note ? <span style={{ color: "var(--muted)", fontSize: 12, marginLeft: 6 }}>{note}</span> : null}</span>
+      <span>{formatUSD(value)}</span>
+    </div>
+  );
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>{title}</h2>
+        <div className="kv-row" style={{ padding: "6px 0", fontSize: 16 }}>
+          <span>合計（概算）</span>
+          <span>{formatUSD(summary.total)}{summary.unpriced > 0 ? "（一部未計上）" : ""}</span>
+        </div>
+        <div className="spend-head">種別</div>
+        {SPEND_KINDS.map(({ k, label }) => row(label, summary.byKind[k], `${summary.counts[k]}回`))}
+        <div className="spend-head">項目</div>
+        {row("入力", summary.byCat.input)}
+        {row("書き込み", summary.byCat.write)}
+        {row("読み", summary.byCat.read)}
+        {row("出力", summary.byCat.output)}
+        {summary.searches > 0 && row("Web検索", summary.byCat.webSearch, `${summary.searches}回`)}
+        {summary.unpriced > 0 && (
+          <div className="spend-note">
+            単価未設定のモデル（{summary.unpricedModels.join("、")}）の {summary.unpriced} 回分は計上していない。設定の「料金単価」から単価を追加できる。
+          </div>
+        )}
+        {summary.legacyZeroWrite && (
+          <div className="spend-note">書き込み表示の修正前の発言は書き込みが0で記録されているため、実際より少なく出ることがあります。</div>
+        )}
+        <div className="spend-note">APIの usage と単価表から出した概算。実際の請求額とは異なることがある。</div>
+        <div className="modal-actions">
+          <button onClick={onClose}>閉じる</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // モデル発言の下に出す「書き付けた」行。jotted の無い過去メッセージには何も出さない。
@@ -1844,8 +2086,8 @@ function JottedLine({ jotted }) {
 }
 
 function ConversationScreen({
-  apiKey, building, room, thread, memories, retrospects, notes,
-  onBack, onUpdateThread, onAddNotes, onOpenBundleMemory, onOpenMemories,
+  apiKey, building, room, thread, memories, retrospects, notes, ledger, priceTable,
+  onBack, onUpdateThread, onAddNotes, onRecordSpend, onOpenBundleMemory, onOpenMemories,
 }) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -1856,6 +2098,9 @@ function ConversationScreen({
   const [editText, setEditText] = useState("");
   const [confirmResend, setConfirmResend] = useState(null); // { index, count }
   const [streamText, setStreamText] = useState(""); // ストリーミング中の本文（保存前のプレーン表示用）
+  const [showSpend, setShowSpend] = useState(false); // 支出の内訳を開いているか
+  const ttl = room.cacheTtl === "1h" ? "1h" : "5m";
+  const spend = summarizeLedger(ledger, ttl, priceTable);
   const bottomRef = useRef(null);
   const lastAssistantRef = useRef(null); // 最後のメッセージが assistant のときだけ付く
   const followRef = useRef(true); // ストリーミング中に下端へ追尾するか（手で上にスクロールしたら止める）
@@ -1933,6 +2178,9 @@ function ConversationScreen({
     resetStream();
     onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
+    // この送信で払った分（周ごと）。保存できた応答は「通常送信」、空応答・エラーで保存しなかった応答は「破棄」として帳簿に記録する
+    const spentRounds = [];
+    let saved = false;
 
     try {
       // block2 は据え置き（resolveBlock2）。ツールループの各周は同じ body を使うので、ターン内でも変わらない
@@ -1941,7 +2189,7 @@ function ConversationScreen({
       let json;
       try {
         json = await callModelWithContinuation({
-          building, apiKey, body, onDelta: appendStream,
+          building, apiKey, body, onDelta: appendStream, onRound: (r) => spentRounds.push(r),
         });
       } catch (e) {
         // 途中で失敗しても、それまでに書き付けられた手控えは残す
@@ -1981,7 +2229,11 @@ function ConversationScreen({
         role: "assistant", content: finalized.content,
         ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
+      // 金額の計算用：その発言を返したモデルと、複数回リクエストしたターンの各回の usage（表示専用。API には送らない）
+      if (json.model) assistantMessage.model = json.model;
+      if (json.rounds && json.rounds.length > 1) assistantMessage.rounds = json.rounds;
       if (jotted.length > 0) assistantMessage.jotted = jotted;
+      saved = true;
       jumpPendingRef.current = true;
       streamedTsRef.current = assistantMessage.ts;
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
@@ -1991,6 +2243,7 @@ function ConversationScreen({
     } catch (e) {
       setError(e);
     } finally {
+      if (spentRounds.length > 0) onRecordSpend(saved ? "send" : "discard", spentRounds);
       resetStream();
       setSending(false);
     }
@@ -2046,6 +2299,8 @@ function ConversationScreen({
         building: { name: building.name, model: building.model },
         room: { name: room.name },
         thread,
+        // このスレッドの支出の帳簿（送信・綴じ・編み・破棄）
+        ledger: ledger || [],
       };
       downloadFile(`${base}.json`, JSON.stringify(data, null, 2), "application/json");
     } else {
@@ -2073,6 +2328,9 @@ function ConversationScreen({
           <span className="crumb" onClick={onBack}>{building.name}</span>
           <span className="sep">/</span>
           <span className="crumb" onClick={onBack}>{room.name}</span>
+          <span className="thread-cost" onClick={() => setShowSpend(true)} title="このスレッドの支出（概算）">
+            {formatUSD(spend.total)}{spend.unpriced > 0 ? "（一部未計上）" : ""}
+          </span>
         </div>
         <div className="topbar-actions" style={{ position: "relative" }}>
           <button onClick={() => setMenuOpen((v) => !v)}>⋯</button>
@@ -2128,7 +2386,7 @@ function ConversationScreen({
               </div>
             )}
             {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
-            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} />}
+            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} cost={messageCost(m, building.model, ttl, priceTable)} />}
           </div>
           </React.Fragment>
           );
@@ -2155,6 +2413,10 @@ function ConversationScreen({
           <button className="accent" onClick={handleSend} disabled={sending || !draft.trim()}>送信</button>
         </div>
       </div>
+
+      {showSpend && (
+        <SpendBreakdownDialog title={`このスレッドの支出 ─ ${thread.title}`} summary={spend} onClose={() => setShowSpend(false)} />
+      )}
 
       {confirmResend && (
         <ConfirmDialog
@@ -2186,7 +2448,7 @@ function InlineTextEditor({ value, onChange, confirmLabel, onCancel, onConfirm }
 }
 
 function MemoriesScreen({
-  room, memories, retrospect, notes, onBack,
+  room, memories, retrospect, notes, roomSpend, onBack,
   onDeleteMemory, onDeleteNote, onSaveMemory, onSaveNote, onAddMemory, onAddNote, onWeave,
 }) {
   const [weaving, setWeaving] = useState(false);
@@ -2268,6 +2530,12 @@ function MemoriesScreen({
       <div className="usage-line" style={{ marginTop: 0, marginBottom: 16 }}>
         いま栞が携えている記憶：未編みの記録 {unwoven.length}件{retrospect ? " ＋ 回想録" : ""}{notes.length > 0 ? ` ＋ 手控え ${notes.length}件` : ""} ／ 約{charCount.toLocaleString()}字
       </div>
+
+      {roomSpend && (
+        <div className="usage-line" style={{ marginTop: -8, marginBottom: 16 }}>
+          部屋の編み代 {formatUSD(roomSpend.total)}{roomSpend.unpriced > 0 ? "（一部未計上）" : ""} ─ スレッドを開かずに編んだ分
+        </div>
+      )}
 
       {weaving && <div className="msg msg-loading">（回想録を編んでいる）</div>}
       <ErrorBox error={error} />
@@ -2362,7 +2630,119 @@ function MemoriesScreen({
 
 /* ===== 設定画面 ===== */
 
-function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup, onScanJotCleanup, onRunJotCleanup }) {
+// 料金単価の編集欄。入力は書き換えるたびに（数として読める値なら）すぐ反映する。読めない値は欄を離れたときに元に戻す
+function PriceTableEditor({ table, unpricedModels, onChange, onReset }) {
+  const [version, setVersion] = useState(0); // 入力欄を作り直して、表示を保存済みの値に戻すための番号
+  const [newId, setNewId] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
+
+  function setRate(rowKey, tier, field, text) {
+    const v = Number(text);
+    if (text.trim() === "" || !isFinite(v) || v < 0) return false;
+    onChange(table.map((r) => {
+      if (r.key !== rowKey) return r;
+      if (r.webSearch) return { ...r, perThousand: v };
+      if (tier === "over") return { ...r, over: { ...r.over, rates: { ...r.over.rates, [field]: v } } };
+      return { ...r, rates: { ...r.rates, [field]: v } };
+    }));
+    return true;
+  }
+
+  function addModel(id) {
+    const trimmed = String(id || "").trim();
+    if (!trimmed || findPriceRow(trimmed, table)) return;
+    onChange([...table, { key: `custom-${uid()}`, label: trimmed, ids: [trimmed], custom: true, rates: { input: 0, write5m: 0, write1h: 0, read: 0, output: 0 } }]);
+    setNewId("");
+  }
+
+  const grid = (row, tier, rates) => (
+    <div className="price-grid">
+      {PRICE_FIELDS.map(({ k, label }) => (
+        <div key={`${version}-${tier}-${k}`}>
+          <label>{label}</label>
+          <input
+            type="text"
+            inputMode="decimal"
+            defaultValue={String(rates[k])}
+            onChange={(e) => setRate(row.key, tier, k, e.target.value)}
+            onBlur={(e) => { if (!setRate(row.key, tier, k, e.target.value)) setVersion((n) => n + 1); }}
+          />
+        </div>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="settings-block">
+      <h2>料金単価</h2>
+      <div className="usage-line" style={{ marginTop: 0, marginBottom: 6 }}>
+        USD ／ 100万トークン（Web検索は1,000回あたり）。スレッドの概算金額の計算に使う（表示だけで、送る内容には影響しない）。
+      </div>
+      {table.filter((row) => row.webSearch).map((row) => (
+        <div className="price-row" key={`${version}-${row.key}`}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <span>{row.label}<span className="usage-line" style={{ marginLeft: 8 }}>どのモデルでも共通</span></span>
+            <input
+              type="text"
+              inputMode="decimal"
+              style={{ width: 90, padding: "6px 6px", fontSize: 13, borderRadius: 8 }}
+              defaultValue={String(row.perThousand)}
+              onChange={(e) => setRate(row.key, "base", "perThousand", e.target.value)}
+              onBlur={(e) => { if (!setRate(row.key, "base", "perThousand", e.target.value)) setVersion((n) => n + 1); }}
+            />
+          </div>
+        </div>
+      ))}
+      {table.filter((row) => row.rates).map((row) => (
+        <div className="price-row" key={`${version}-${row.key}`}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10 }}>
+            <span>{row.label}</span>
+            {row.custom && (
+              <button style={{ border: "none", fontSize: 12, color: "var(--muted)" }} onClick={() => onChange(table.filter((r) => r.key !== row.key))}>削除</button>
+            )}
+          </div>
+          {row.over && <div className="usage-line" style={{ marginTop: 4 }}>入力合計 {row.over.threshold.toLocaleString()} 以下</div>}
+          {grid(row, "base", row.rates)}
+          {row.over && (
+            <>
+              <div className="usage-line" style={{ marginTop: 8 }}>入力合計 {row.over.threshold.toLocaleString()} 超（そのリクエスト全体）</div>
+              {grid(row, "over", row.over.rates)}
+            </>
+          )}
+        </div>
+      ))}
+      {unpricedModels.length > 0 && (
+        <div className="price-row">
+          {unpricedModels.map((id) => (
+            <div className="kv-row" key={id} style={{ borderBottom: "none", padding: "4px 0" }}>
+              <span>{id} ─ 単価未設定</span>
+              <button onClick={() => addModel(id)}>単価を追加</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="kv-row">
+        <input type="text" value={newId} onChange={(e) => setNewId(e.target.value)} placeholder="モデルIDを入れて追加（例：claude-xxx）" />
+        <button style={{ flexShrink: 0 }} disabled={!newId.trim() || !!findPriceRow(newId, table)} onClick={() => addModel(newId)}>追加</button>
+      </div>
+      <div className="kv-row">
+        <span>組み込みの単価（2026年11月時点）に戻す</span>
+        <button style={{ flexShrink: 0 }} onClick={() => setConfirmReset(true)}>初期値に戻す</button>
+      </div>
+      {confirmReset && (
+        <ConfirmDialog
+          title="料金単価を初期値に戻す"
+          message="編集した単価と、追加したモデルの単価は消えて、組み込みの初期値に戻る。よい？"
+          confirmLabel="戻す"
+          onCancel={() => setConfirmReset(false)}
+          onConfirm={() => { setConfirmReset(false); onReset(); setVersion((n) => n + 1); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePrices, onResetPrices, onBack, onSaveApiKey, onDeleteApiKey, onToggleTheme, onWipeAll, onExportBackup, onRestoreBackup, onScanJotCleanup, onRunJotCleanup }) {
   const [cleanupScan, setCleanupScan] = useState(null); // 調べた結果（summary）
   const [cleanupResult, setCleanupResult] = useState(null); // 掃除した結果（summary）
   const [confirmCleanup, setConfirmCleanup] = useState(false);
@@ -2428,10 +2808,12 @@ function SettingsScreen({ apiKey, theme, onBack, onSaveApiKey, onDeleteApiKey, o
         </div>
       </div>
 
+      <PriceTableEditor table={priceTable} unpricedModels={unpricedModels} onChange={onChangePrices} onReset={onResetPrices} />
+
       <div className="settings-block">
         <h2>バックアップ</h2>
         <div className="kv-row">
-          <span>棟・部屋・スレッド・記録を書き出す</span>
+          <span>棟・部屋・スレッド・記録・支出の帳簿を書き出す</span>
           <button onClick={onExportBackup}>書き出す</button>
         </div>
         <div className="kv-row">
@@ -2567,6 +2949,8 @@ function App() {
   const [memories, setMemoriesState] = useState(() => loadJSON(K.memories, []));
   const [retrospects, setRetrospectsState] = useState(() => loadJSON(K.retrospects, {}));
   const [notes, setNotesState] = useState(() => loadJSON(K.notes, []));
+  const [ledgers, setLedgersState] = useState(() => normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS)));
+  const [priceTable, setPriceTableState] = useState(() => loadPriceTable());
   const [route, setRoute] = useState(() => computeInitialRoute());
 
   function computeInitialRoute() {
@@ -2629,9 +3013,59 @@ function App() {
   function setMemories(next) { setMemoriesState(next); saveJSON(K.memories, next); }
   function setRetrospects(next) { setRetrospectsState(next); saveJSON(K.retrospects, next); }
   function setNotes(next) { setNotesState(next); saveJSON(K.notes, next); }
+  function setLedgers(next) { setLedgersState(next); saveJSON(K.ledgers, next); }
+  function setPriceTable(next) { setPriceTableState(next); saveJSON(K.prices, next); }
+  function resetPriceTable() { localStorage.removeItem(K.prices); setPriceTableState(DEFAULT_PRICE_TABLE); }
+
+  // 帳簿の無いスレッドに、保存済みの発言から帳簿を作って入れる（一度だけ）。ledgersData を書き換えて、作ったかを返す
+  function ensureThreadLedger(ledgersData, threadId) {
+    if (Array.isArray(ledgersData.threads[threadId])) return false;
+    const t = loadJSON(K.threads, []).find((x) => x.id === threadId);
+    if (!t) return false;
+    const r = loadJSON(K.rooms, []).find((x) => x.id === t.roomId);
+    const b = r && loadJSON(K.buildings, []).find((x) => x.id === r.buildingId);
+    ledgersData.threads[threadId] = ledgerFromMessages(t, b ? b.model : null);
+    return true;
+  }
+
+  // 支出を帳簿に記録する。rounds は API を呼んだ回ごとの { model, usage }。
+  // threadId のスレッドがあればそこへ、無ければ（スレッドを開かずに編んだ等）roomId の部屋の帳簿へ。
+  // 送信は非同期で終わるため、レンダー時点の ledgers ではなく保存済みの最新に足す。発言が消えても帳簿からは消さない
+  function recordSpend({ threadId, roomId }, kind, rounds) {
+    const list = (rounds || []).filter((r) => r && r.usage);
+    if (list.length === 0) return;
+    const ts = nowISO();
+    const entries = list.map((r) => ({ ts, kind, model: r.model || null, usage: r.usage }));
+    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    if (threadId && (Array.isArray(next.threads[threadId]) || ensureThreadLedger(next, threadId))) {
+      next.threads[threadId] = [...next.threads[threadId], ...entries];
+    } else if (roomId) {
+      next.rooms[roomId] = [...(Array.isArray(next.rooms[roomId]) ? next.rooms[roomId] : []), ...entries];
+    } else return;
+    setLedgers(next);
+  }
+
+  // 帳簿の無い既存スレッドを開いたら、過去の発言の usage から帳簿を作る（一度だけ）
+  useEffect(() => {
+    if (route.screen !== "conversation" || !route.threadId) return;
+    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    if (ensureThreadLedger(next, route.threadId)) setLedgers(next);
+  }, [route.screen, route.threadId]);
+
+  // 消えたスレッド・部屋の帳簿を片づける
+  function pruneLedgers({ threadIds = [], roomIds = [] }) {
+    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    threadIds.forEach((id) => delete next.threads[id]);
+    roomIds.forEach((id) => delete next.rooms[id]);
+    setLedgers(next);
+  }
   // 全データのバックアップを書き出す。APIキー・テーマ・lastThreadId は含めない
   function exportBackup(suffix) {
-    const data = { app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []) };
+    const data = {
+      app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []),
+      ledgers: normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS)),
+      prices: loadJSON(K.prices, null), // 単価を編集していなければ null（初期値のまま）
+    };
     const name = suffix ? `shiori_backup_${todayYMD()}_${suffix}.json` : `shiori_backup_${todayYMD()}.json`;
     downloadFile(name, JSON.stringify(data, null, 2), "application/json");
   }
@@ -2653,6 +3087,27 @@ function App() {
     );
   }
 
+  // 単価表に無いモデル（棟のモデル・帳簿・発言に出てくるもの）。設定画面で「単価未設定」として出す
+  function unpricedModelIds() {
+    const ids = new Set();
+    buildings.forEach((b) => b.model && ids.add(b.model));
+    Object.values(ledgers.threads).concat(Object.values(ledgers.rooms)).forEach((list) => {
+      if (Array.isArray(list)) list.forEach((e) => e && e.model && ids.add(e.model));
+    });
+    threads.forEach((t) => (t.messages || []).forEach((m) => {
+      if (m && m.model) ids.add(m.model);
+      if (m && Array.isArray(m.rounds)) m.rounds.forEach((r) => r && r.model && ids.add(r.model));
+    }));
+    const seen = new Set();
+    return [...ids].filter((id) => {
+      if (findPriceRow(id, priceTable)) return false;
+      const n = normalizeModelId(id);
+      if (seen.has(n)) return false;
+      seen.add(n);
+      return true;
+    });
+  }
+
   const building = buildings.find((b) => b.id === route.buildingId);
   const room = rooms.find((r) => r.id === route.roomId);
   const thread = threads.find((t) => t.id === route.threadId);
@@ -2662,6 +3117,10 @@ function App() {
       <SettingsScreen
         apiKey={apiKey}
         theme={theme}
+        priceTable={priceTable}
+        unpricedModels={unpricedModelIds()}
+        onChangePrices={setPriceTable}
+        onResetPrices={resetPriceTable}
         onBack={goBack}
         onSaveApiKey={(key) => { localStorage.setItem(K.apiKey, key); setApiKey(key); }}
         onDeleteApiKey={() => { localStorage.removeItem(K.apiKey); setApiKey(""); }}
@@ -2693,6 +3152,10 @@ function App() {
           saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {});
           // 手控えキーの無い旧バックアップも読み込める
           saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []);
+          // 帳簿キーの無い旧バックアップも読み込める（各スレッドを開いたときに発言から作り直す）
+          saveJSON(K.ledgers, normalizeLedgers(data.ledgers));
+          // 単価を編集したバックアップなら単価も戻す。無ければ今の単価のまま
+          if (Array.isArray(data.prices)) saveJSON(K.prices, data.prices);
           localStorage.removeItem(K.lastThreadId);
           invalidateBlock2(); // データを丸ごと入れ替えたので控えも捨てる
           window.location.reload();
@@ -2709,6 +3172,8 @@ function App() {
         memories={roomMemories}
         retrospect={retrospects[room.id] || null}
         notes={notes.filter((n) => n.roomId === room.id)}
+        roomSpend={Array.isArray(ledgers.rooms[room.id]) && ledgers.rooms[room.id].length > 0
+          ? summarizeLedger(ledgers.rooms[room.id], room.cacheTtl === "1h" ? "1h" : "5m", priceTable) : null}
         onBack={goBack}
         // 記録帳での編集・追加・削除は、次の送信から block2 に反映する（invalidateBlock2）
         onDeleteMemory={(id) => { setMemories(memories.filter((m) => m.id !== id)); invalidateBlock2(room.id); }}
@@ -2737,7 +3202,12 @@ function App() {
               extraMessages: [{ role: "user", content: WEAVE_INSTRUCTION + listing }],
             },
           );
-          const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
+          // 編み代は、記録帳を開く前に開いていたスレッドに計上する。スレッドから来ていなければ部屋の帳簿へ
+          const spendTarget = { threadId: thread && thread.roomId === room.id ? thread.id : null, roomId: room.id };
+          const json = await callModelRetryOnEmpty(
+            { building, apiKey, body, onRound: (r) => recordSpend(spendTarget, "weave", [r]) },
+            (texts) => addNotes(room.id, texts),
+          );
           console.log("[書斎] weave usage", json.usage, "読", json.usage && json.usage.cache_read_input_tokens, "書", cacheWriteTokens(json.usage));
           // 綴じと同じく、テキスト化された呼び出しは取り除き、中身は手控えとして回収する
           const finalized = finalizeAssistantContent(json.content);
@@ -2768,12 +3238,17 @@ function App() {
         memories={memories}
         retrospects={retrospects}
         notes={notes}
+        // 帳簿がまだ無い（初めて開いた直後）ときは、発言から作った帳簿で表示する（useEffect で保存される）
+        ledger={Array.isArray(ledgers.threads[thread.id]) ? ledgers.threads[thread.id] : ledgerFromMessages(thread, building.model)}
+        priceTable={priceTable}
+        onRecordSpend={(kind, rounds) => recordSpend({ threadId: thread.id, roomId: room.id }, kind, rounds)}
         onBack={goBack}
         onUpdateThread={(updated) => {
           setThreads(threads.map((t) => (t.id === updated.id ? updated : t)));
         }}
         onAddNotes={(texts) => addNotes(room.id, texts)}
-        onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
+        // threadId を持たせて、記録帳で編んだときの編み代をこのスレッドに計上する
+        onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id, threadId: thread.id })}
         onOpenBundleMemory={async () => {
           // 棟のモデル本人が、会話の続きとして自分で綴じる。
           // 通常送信と同じ buildRequestBody を通すので、直前の会話のキャッシュをそのまま読める。
@@ -2792,7 +3267,11 @@ function App() {
             },
           );
           // tool_choice: none なので通常は書き付けられないが、万一書き付けられたら手控えとして残す
-          const json = await callModelRetryOnEmpty({ building, apiKey, body }, (texts) => addNotes(room.id, texts));
+          // 綴じ代は1回ずつ（自動リトライ・継続の各回も）このスレッドの帳簿に記録する
+          const json = await callModelRetryOnEmpty(
+            { building, apiKey, body, onRound: (r) => recordSpend({ threadId: thread.id, roomId: room.id }, "bundle", [r]) },
+            (texts) => addNotes(room.id, texts),
+          );
           console.log("[書斎] bundle usage", json.usage, "読", json.usage && json.usage.cache_read_input_tokens, "書", cacheWriteTokens(json.usage));
           // tool_choice: none だと呼び出しを本文にテキストで書くことがある。記録帳に入ると毎回注入されて真似が広がるので、
           // 必ず取り除き、中身は手控えとして回収する
@@ -2838,6 +3317,7 @@ function App() {
         }}
         onDeleteThread={(threadId) => {
           setThreads(threads.filter((t) => t.id !== threadId));
+          pruneLedgers({ threadIds: [threadId] });
           setMemories(memories); // 記録帳はスレッド削除では消えない(部屋単位のため)
           if (localStorage.getItem(K.lastThreadId) === threadId) localStorage.removeItem(K.lastThreadId);
         }}
@@ -2865,6 +3345,7 @@ function App() {
           setRooms(rooms.filter((r) => r.id !== roomId));
           const doomedThreadIds = new Set(threads.filter((t) => t.roomId === roomId).map((t) => t.id));
           setThreads(threads.filter((t) => t.roomId !== roomId));
+          pruneLedgers({ threadIds: [...doomedThreadIds], roomIds: [roomId] });
           setMemories(memories.filter((m) => m.roomId !== roomId));
           setNotes(notes.filter((n) => n.roomId !== roomId));
           if (retrospects[roomId]) {
@@ -2898,6 +3379,7 @@ function App() {
         setBuildings(buildings.filter((b) => b.id !== buildingId));
         setRooms(rooms.filter((r) => r.buildingId !== buildingId));
         setThreads(threads.filter((t) => !doomedRoomIds.has(t.roomId)));
+        pruneLedgers({ threadIds: threads.filter((t) => doomedRoomIds.has(t.roomId)).map((t) => t.id), roomIds: [...doomedRoomIds] });
         setMemories(memories.filter((m) => !doomedRoomIds.has(m.roomId)));
         setNotes(notes.filter((n) => !doomedRoomIds.has(n.roomId)));
         const nextRetrospects = { ...retrospects };
