@@ -438,7 +438,7 @@ const JOT_TOOL = {
   description:
     "会話の途中で「これは残しておきたい」と思った事実・約束・好み・出来事を、その場で手控え帖に書き付ける。" +
     "書き付けた内容は次回以降の会話で【手控え】としてあなたの手元に戻ってくる。回想録に溶けず、消されるまで残り続ける。" +
-    "本当に残したいことだけを、1件につき120字以内で簡潔に。会話の返事は通常どおり続けること。" +
+    "本当に残したいことだけを、1件につき120字以内で簡潔に。書き付けるのは、返事の本文を最後まで書き終えたあとにすること（返事の前や途中では呼ばない）。書き付けたあとに続きを書く必要はない。保存の結果は、次のやりとりの冒頭で返ってくる。" +
     "残したいことがあれば必ずこのツールで書き付けること。ツールの呼び出しを本文にテキストで書かないこと。",
   input_schema: {
     type: "object",
@@ -930,6 +930,21 @@ function expandToolTurns(message, keepTools) {
     cur.content.push(b);
   });
   return out;
+}
+
+// 履歴の最後の assistant 発言が tool_result で終わっていれば（手控えの後払い待ち・ツールループの打ち切り）その位置、無ければ -1
+function pendingToolResultIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== "assistant") continue;
+    const c = messages[i].content;
+    return Array.isArray(c) && c.length > 0 && c[c.length - 1].type === "tool_result" ? i : -1;
+  }
+  return -1;
+}
+
+// messages[index]（assistant 発言）の tool_use / tool_result だけを落とした新しい配列を返す（ほかの発言・jotted などはそのまま）
+function dropToolBlocksAt(messages, index) {
+  return messages.map((m, i) => (i === index ? { ...m, content: joinAcrossToolBoundaries(m.content) } : m));
 }
 
 // tool_use / tool_result を落とし、ツールを挟んだ前後の text を空行1つでつなぐ（表示用・送信用の両方で使う）
@@ -1564,7 +1579,14 @@ function runClientTool(block, jotted) {
 // onThinkingDelta（任意）は各周回の thinking_delta をそのまま渡す（出力中の表示用）。
 // thinking は全周の thinking ブロックの本文を出現順に空行で連結したもの（無ければ ""。表示・ログ専用で、API には送り返さない）。
 // 途中でエラーになった場合は、それまでに usage が返ってきた周の数を error.roundsDone に載せる（未対応パラメータの送り直しの判定用）。
-async function callModelWithContinuation({ building, apiKey, body, onDelta, onThinkingDelta, onRound }) {
+// deferJotResult（任意。通常送信・編集＆再送信だけが true を渡す）：手控えの「後払い」。tool_use で止まった周が
+//   ・tool_use がすべて jot_note で、返した tool_result がすべて成功（is_error なし）
+//   ・この送信でここまでに積んだ content に見える本文がある（返事を書き終えたあとの書き付け）
+//   のすべてを満たすなら、続きのリクエストを送らずにループを抜け、deferred: true を返す。
+//   tool_result は content の末尾に残り、次の送信で expandToolTurns / mergeSameRoleMessages により
+//   user [tool_result, text(次の発言)] の形で返る。truncated は false のまま。stop_reason は API の "tool_use" のまま返す
+//   （表示側は保存した jotDeferred で「tool_use ─」を出さない）。
+async function callModelWithContinuation({ building, apiKey, body, onDelta, onThinkingDelta, onRound, deferJotResult }) {
   const content = [];
   const rounds = [];
   const jotted = [];
@@ -1572,6 +1594,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
   let totalUsage = null;
   let toolRounds = 0;
   let truncated = false;
+  let deferred = false;
   let wroteText = false;
   let needSep = false;
   const delta = typeof onDelta === "function"
@@ -1611,6 +1634,14 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
         const toolResults = uses.map((b) => runClientTool(b, jotted));
         // 履歴に構造のまま残すため、返した tool_result も並び順どおり content に差し込む（打ち切る場合も、書き付けは実行済みなので残す）
         content.push(...toolResults);
+        if (deferJotResult
+          && uses.every((b) => b.name === JOT_TOOL.name)
+          && toolResults.every((r) => !r.is_error)
+          && hasVisibleText(content)) {
+          console.log("[書斎] 手控えを後払いにして、このターンを終える（tool_result は次の送信で返す）");
+          deferred = true;
+          break;
+        }
         toolRounds++;
         if (toolRounds > TOOL_LOOP_MAX) {
           console.warn(`[書斎] tool_use の継続が上限（${TOOL_LOOP_MAX}回）に達したため打ち切り`);
@@ -1639,7 +1670,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
     throw e;
   }
   return {
-    content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, rounds, model: json.model || body.model,
+    content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, deferred, rounds, model: json.model || body.model,
     thinking: joinThinkingText(content),
   };
 }
@@ -1692,18 +1723,42 @@ function fallbackNoticeText(kind, body) {
   return `この部屋のモデル（${model}）は考える深さ（effort${effort ? `: ${effort}` : ""}）の指定に対応していないため、外して送った`;
 }
 
+// 後払い明けの送信（tool_result で終わる assistant 発言のあと）の400が、ツールブロックの受け渡しによるものらしいか。
+// メッセージがブロック（tool_use / tool_result / thinking ブロック）に触れているときだけ true。判別できなければ false
+function looksLikeToolBoundaryError(e) {
+  return /tool_use|tool_result|thinking[`'"]?\s+blocks?|redacted_thinking/i.test(apiErrorMessage(e));
+}
+
+const DEFERRED_RETRY_NOTICE = "手控えの受け渡しがうまくいかなかったため、直前の発言の書き付けのやりとりを外して送り直した（手控えそのものは残っている）";
+
 // callModelWithContinuation を呼び、未対応の指定で 400 になったら外して送り直す。
-// 返り値は { json, body, notices }。body は最終的に送ったボディ（綴じ・編みの自動再試行で使い回す）、notices は知らせる文の配列
+// 返り値は { json, body, notices, toolsDropped }。body は最終的に送ったボディ（綴じ・編みの自動再試行で使い回す）、notices は知らせる文の配列
+// args.dropDeferredTools（任意。後払い明けの送信だけが渡す）：body を受け取り、後払いで終わった assistant 発言の
+//   tool_use / tool_result だけを落とした body を返す関数。400 で落ちたら1回だけこれで送り直す（安全弁）。
+//   どちらの400か判別できないときは、未対応パラメータの送り直しを先に試す。
+//   エラー文がツールブロックに触れているとき（looksLikeToolBoundaryError）だけ、ツールブロックを落とす方を先に試す。
+//   送り直しが通ったら toolsDropped: true を返す（呼び出し側で保存データからも落とす）
 async function callModelWithParamFallback(args) {
   let body = args.body;
   const done = new Set();
   const notices = [];
+  let toolsDropped = false;
+  const { dropDeferredTools, ...callArgs } = args;
+  const canDropTools = (e) => typeof dropDeferredTools === "function" && !toolsDropped
+    && e && e.status === 400 && !e.roundsDone;
   for (;;) {
     try {
-      const json = await callModelWithContinuation({ ...args, body });
-      return { json, body, notices };
+      const json = await callModelWithContinuation({ ...callArgs, body });
+      return { json, body, notices, toolsDropped };
     } catch (e) {
-      const kind = unsupportedParamOf(e, body, done);
+      let kind = canDropTools(e) && looksLikeToolBoundaryError(e) ? null : unsupportedParamOf(e, body, done);
+      if (!kind && canDropTools(e)) {
+        console.warn("[書斎] 後払い明けの送信が400になったため、直前の発言の tool_use / tool_result を落として送り直す", e.raw);
+        toolsDropped = true;
+        notices.push(DEFERRED_RETRY_NOTICE);
+        body = dropDeferredTools(body);
+        continue;
+      }
       if (!kind) throw e;
       console.warn(`[書斎] このモデルは ${kind} の指定に対応していないため、外して（下げて）送り直す`, e.raw);
       done.add(kind);
@@ -1802,12 +1857,14 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
     }
     return { role: m.role, content };
   });
-  if (options.extraMessages) payloadMessages.push(...options.extraMessages);
+  // 履歴が tool_result（手控えの後払い待ち）で終わっていると、足した指示文（user）と role が続くので1つにまとめる
+  // （user [tool_result, 指示文]）。extraMessages にはキャッシュ境界を付けない
+  const allMessages = options.extraMessages ? mergeSameRoleMessages([...payloadMessages, ...options.extraMessages]) : payloadMessages;
 
   const body = {
     model: building.model,
     max_tokens: options.maxTokens || MAX_TOKENS,
-    messages: payloadMessages,
+    messages: allMessages,
     system,
   };
   if (tools) body.tools = tools;
@@ -2493,7 +2550,8 @@ function TranslateButton({ text }) {
 // モデル発言の下に出すキャッシュ状況の一行。usageの無い過去メッセージには何も出さない。
 // stopReason が end_turn 以外のときだけ、行頭にその値を添える。cost（messageCost の結果）があれば末尾に金額を添える。
 // thinking（保存した思考の本文）があれば行末に「思考 ▸」を置き、タップでこの行の下に展開する（初期値は常に畳む。開閉は保存しない）
-function UsageLine({ usage, stopReason, cost, thinking }) {
+// deferred（手控えを後払いにして終えた発言）なら、stopReason が "tool_use" でも正常終了として行頭に何も添えない
+function UsageLine({ usage, stopReason, deferred, cost, thinking }) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
@@ -2502,7 +2560,7 @@ function UsageLine({ usage, stopReason, cost, thinking }) {
   const text = read > 0 || created > 0
     ? `栞 ─ 読 ${fmt(read)} ・ 書 ${fmt(created)} ・ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`
     : `栞、挟まらず ─ 素 ${fmt(usage.input_tokens)} ・ 出 ${fmt(usage.output_tokens)}`;
-  const prefix = stopReason && stopReason !== "end_turn" ? `${stopReason} ─ ` : "";
+  const prefix = stopReason && stopReason !== "end_turn" && !(deferred && stopReason === "tool_use") ? `${stopReason} ─ ` : "";
   const costText = !cost ? "" : cost.unpriced ? " ・ 単価未設定" : ` ・ ${formatUSD(cost.total)}`;
   const hasThinking = typeof thinking === "string" && thinking.trim() !== "";
   if (!hasThinking) return <div className="usage-line">{prefix}{text}{costText}</div>;
@@ -2720,6 +2778,7 @@ function ConversationScreen({
   }
 
   async function runSend(nextMessages) {
+    // nextMessages は安全弁（後払い明けの400）でツールブロックを落とした形に差し替えることがある
     setError(null);
     setBundleNotice(null);
     setSendNotice(null);
@@ -2736,18 +2795,33 @@ function ConversationScreen({
       // block2 は据え置き（resolveBlock2）。ツールループの各周は同じ body を使うので、ターン内でも変わらない
       const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
       // 部屋ごとの指定：effort（おまかせなら付けない）・出力上限・「思考を見る」部屋だけ thinking
-      const body = buildRequestBody(
-        { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate }, nextMessages,
-        { block2Text, ...sendOptionsFor(room) },
-      );
+      const ctx = { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate };
+      const sendOptions = { block2Text, ...sendOptionsFor(room) };
+      const body = buildRequestBody(ctx, nextMessages, sendOptions);
+      // 後払い明けの送信か（履歴の最後の assistant 発言が tool_result で終わっている）。手控えOFFの部屋は送信時にツールブロックを落とすので対象外
+      const deferredIndex = room.jotNote ? pendingToolResultIndex(nextMessages) : -1;
       let json;
       try {
         // 未対応の指定（effort・thinking・出力上限）で 400 になったら、その指定だけ外して1回送り直し、知らせる
+        // 後払い明けの送信が 400 になったら、その発言のツールブロックだけ落として1回送り直す（dropDeferredTools）
         const r = await callModelWithParamFallback({
           building, apiKey, body, onDelta: appendStream, onThinkingDelta: appendThinking, onRound: (r) => spentRounds.push(r),
+          deferJotResult: true,
+          dropDeferredTools: deferredIndex === -1 ? undefined
+            : (cur) => ({ ...cur, messages: buildRequestBody(ctx, dropToolBlocksAt(nextMessages, deferredIndex), sendOptions).messages }),
         });
         json = r.json;
         if (r.notices.length > 0) setSendNotice(r.notices.join("\n"));
+        if (r.toolsDropped) {
+          // 次回以降に同じ400を踏まないよう、保存してあるその発言からもツールブロックを落とす（手控えそのものは保存済みなので触れない）
+          nextMessages = dropToolBlocksAt(nextMessages, deferredIndex);
+          onUpdateThread({ ...thread, messages: nextMessages });
+        }
+        if (deferredIndex !== -1) {
+          // 未確認事項の判定用：後払い明けのターンで thinking が返ってきたか（履歴の thinking は送っていない）
+          const hasThinking = (json.content || []).some((b) => b.type === "thinking" || b.type === "redacted_thinking");
+          console.log("[書斎] 後払い明けのターン：thinking ブロック", hasThinking ? "あり" : "なし", r.toolsDropped ? "（ツールブロックを落として送り直した）" : "");
+        }
       } catch (e) {
         // 途中で失敗しても、それまでに書き付けられた手控えは残す
         if (e.jotted) onAddNotes(e.jotted);
@@ -2786,6 +2860,8 @@ function ConversationScreen({
         role: "assistant", content: finalized.content,
         ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
+      // 手控えを後払いにして終えた発言（stop_reason は "tool_use" のままだが正常終了。usage 行に「tool_use ─」を出さない）
+      if (json.deferred) assistantMessage.jotDeferred = true;
       // 金額の計算用：その発言を返したモデルと、複数回リクエストしたターンの各回の usage（表示専用。API には送らない）
       if (json.model) assistantMessage.model = json.model;
       if (json.rounds && json.rounds.length > 1) assistantMessage.rounds = json.rounds;
@@ -2959,7 +3035,7 @@ function ConversationScreen({
               </div>
             )}
             {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
-            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} cost={messageCost(m, building.model, ttl, priceTable)} thinking={m.thinking} />}
+            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} deferred={!!m.jotDeferred} cost={messageCost(m, building.model, ttl, priceTable)} thinking={m.thinking} />}
           </div>
           </React.Fragment>
           );
