@@ -433,12 +433,15 @@ const RETROSPECT_MAX_TOKENS = 4096;
 const CONTINUATION_MAX_ROUNDS = 8; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
 const TOOL_LOOP_MAX = 5; // うち tool_use（クライアントツール）で続きを生成させる回数の上限。超えたら打ち切ってエラー表示
 const JOT_NOTE_MAX_CHARS = 120;
+const JOT_SAVED_TEXT = "保存しました";
+// 後払いにならず続きを送る周で、その時点で見える本文がまだ無いときの成功の文言（書き付けだけで終えるのを防ぐ）
+const JOT_SAVED_NEED_REPLY_TEXT = "保存しました。続けて、返事の本文を書いてください。";
 const JOT_TOOL = {
   name: "jot_note",
   description:
     "会話の途中で「これは残しておきたい」と思った事実・約束・好み・出来事を、その場で手控え帖に書き付ける。" +
     "書き付けた内容は次回以降の会話で【手控え】としてあなたの手元に戻ってくる。回想録に溶けず、消されるまで残り続ける。" +
-    "本当に残したいことだけを、1件につき120字以内で簡潔に。書き付けるのは、返事の本文を最後まで書き終えたあとにすること（返事の前や途中では呼ばない）。書き付けたあとに続きを書く必要はない。保存の結果は、次のやりとりの冒頭で返ってくる。" +
+    "本当に残したいことだけを、1件につき120字以内で簡潔に。書き付けるのは、返事の本文を最後まで書き終えたあとにすること（返事の前や途中では呼ばない）。返事の本文は必ず書くこと。書き付けだけで応答を終えない。" +
     "残したいことがあれば必ずこのツールで書き付けること。ツールの呼び出しを本文にテキストで書かないこと。",
   input_schema: {
     type: "object",
@@ -1563,7 +1566,7 @@ function runClientTool(block, jotted) {
   const text = normalizeJotText(block.input && block.input.text);
   if (!text) return result("書き付ける内容（text）が空だったため、保存できなかった。", true);
   jotted.push(text);
-  return result("保存しました", false);
+  return result(JOT_SAVED_TEXT, false);
 }
 
 // 応答を最後まで受け取るための継続ループ。通常送信・編集＆再送信・綴じ・編みの全経路がここを通る。
@@ -1647,6 +1650,13 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
           console.warn(`[書斎] tool_use の継続が上限（${TOOL_LOOP_MAX}回）に達したため打ち切り`);
           truncated = true;
           break;
+        }
+        // 続きを送るのに、この送信でまだ見える本文が無ければ、成功した jot_note の tool_result で本文を促す
+        // （toolResults は content に積んだものと同じオブジェクトなので、保存される履歴の文言も揃う）
+        if (!hasVisibleText(content)) {
+          toolResults.forEach((r, i) => {
+            if (!r.is_error && uses[i].name === JOT_TOOL.name) r.content = JOT_SAVED_NEED_REPLY_TEXT;
+          });
         }
         followUp = [
           { role: "assistant", content: resendContent },
