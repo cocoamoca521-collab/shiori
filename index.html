@@ -121,7 +121,7 @@
     margin-bottom: 24px;
     /* 画面上部に固定。.page の上余白ぶんを内側に取り込み、見た目の位置は変えない */
     position: sticky;
-    top: 0;
+    top: var(--save-band-h, 0px); /* 保存の失敗の帯が出ている間は、その下に止める */
     z-index: 3;
     background: transparent;
     margin-top: -24px;
@@ -260,6 +260,23 @@
   .spend-detail-ts { color: var(--faint); white-space: nowrap; }
   .spend-notice { margin-top: -12px; }
   .spend-head { color: var(--muted); font-size: 12px; margin-top: 16px; }
+  /* 保存の失敗の帯（画面上部に出し続ける） */
+  .save-band { position: sticky; top: 0; z-index: 6; background: var(--input-bg); border-bottom: 1px solid var(--error); color: var(--error); font-size: 12px; line-height: 1.7; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .save-band-inner { max-width: 640px; margin: 0 auto; padding: 10px 20px; display: flex; align-items: flex-start; gap: 12px; }
+  .save-band-text { flex: 1; }
+  .save-band-detail { font-size: 10px; opacity: 0.8; margin-top: 2px; overflow-wrap: anywhere; }
+  .save-band-link { flex-shrink: 0; border: 1px solid var(--error); background: transparent; color: var(--error); border-radius: 10px; padding: 3px 10px; font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap; }
+  /* 置き場の残りが少ないときの予告（会話画面の上部） */
+  .storage-warning { display: flex; align-items: flex-start; gap: 8px; margin: -12px 0 16px; color: var(--accent-text); font-size: 12px; line-height: 1.7; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .storage-warning-text { flex: 1; cursor: pointer; }
+  .storage-warning-close { border: none; background: none; color: var(--muted); font-size: 14px; line-height: 1; padding: 2px 4px; cursor: pointer; }
+  /* 置き場の使用量（設定画面） */
+  .storage-total { font-size: 14px; margin: 4px 0 8px; }
+  .storage-bar { height: 4px; border-radius: 2px; background: var(--rule); overflow: hidden; margin-bottom: 8px; }
+  .storage-bar > div { height: 100%; background: var(--accent); }
+  .storage-bar.warn > div, .storage-bar.critical > div { background: var(--error); }
+  .storage-row { font-size: 13px; padding: 6px 0; }
+  .storage-sub { padding-left: 1em; color: var(--muted); font-size: 12px; }
   .spend-note { color: var(--muted); font-size: 12px; margin-top: 10px; line-height: 1.7; }
   .price-row { border-bottom: 1px solid var(--rule); padding: 12px 0; }
   .price-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-top: 6px; }
@@ -624,8 +641,108 @@ function loadJSON(key, fallback) {
   }
 }
 
+/* ----- 保存の失敗を見えるようにする -----
+   localStorage への書き込みはすべて safeSetItem（saveJSON）を通す。失敗しても例外は投げず false を返し、
+   失敗したキーを saveFailures に控えて、画面上部の帯（SaveFailureBand）に知らせる。
+   帯は「失敗したキーがどれも、あとで保存に成功する（または消す）」まで出し続ける
+   （小さなキー（テーマ等）の保存が通っただけで、保存できていないスレッドがあるのに帯が消えないようにするため）。 */
+const saveFailures = new Map(); // key → { quota, detail, at }
+const saveFailureListeners = new Set();
+let saveFailureSeq = 0;
+
+function isQuotaExceeded(e) {
+  return !!e && (e.name === "QuotaExceededError" || e.name === "NS_ERROR_DOM_QUOTA_REACHED" || e.code === 22 || e.code === 1014);
+}
+
+// 帯に出す内容。失敗が無ければ null。1つでも容量超過があれば容量超過の文面にする
+function saveFailureSnapshot() {
+  if (saveFailures.size === 0) return null;
+  const list = [...saveFailures.values()].sort((a, b) => a.at - b.at);
+  const last = list[list.length - 1];
+  return { quota: list.some((f) => f.quota), detail: last.detail, keys: [...saveFailures.keys()] };
+}
+
+function notifySaveFailure() {
+  const snap = saveFailureSnapshot();
+  saveFailureListeners.forEach((fn) => { try { fn(snap); } catch (e) { console.warn(e); } });
+}
+
+function markSaveFailed(key, e) {
+  console.warn(`[書斎] 保存できなかった（${key}）`, e);
+  saveFailures.set(key, { quota: isQuotaExceeded(e), detail: `${(e && e.name) || "Error"}: ${(e && e.message) || String(e)}`, at: ++saveFailureSeq });
+  notifySaveFailure();
+}
+
+function markSaved(key) {
+  if (saveFailures.delete(key)) notifySaveFailure();
+}
+
+// 書き込めたら true。失敗したら帯に知らせて false（例外は投げない）
+function safeSetItem(key, text) {
+  try {
+    localStorage.setItem(key, text);
+  } catch (e) {
+    markSaveFailed(key, e);
+    return false;
+  }
+  markSaved(key);
+  return true;
+}
+
+function safeRemoveItem(key) {
+  try { localStorage.removeItem(key); } catch (e) { console.warn(`[書斎] 消せなかった（${key}）`, e); return; }
+  markSaved(key); // 消せたキーは「保存できていない」状態ではなくなる
+}
+
 function saveJSON(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
+  return safeSetItem(key, JSON.stringify(value));
+}
+
+/* ----- 置き場の使用量（目安） -----
+   localStorage の全キーの「キーの文字数＋値の文字数」の合計（文字数ベース）。同じオリジン（GitHub Pages の同じアカウント）の
+   他のアプリの分も含む。上限はブラウザで違うので、Chrome 系の 10MB を UTF-16 の文字数に直した値を目安にする。
+   実際に書き込んで上限を探ることはしない。 */
+const STORAGE_LIMIT_CHARS = 5242880;
+const STORAGE_PREFIX = "shosai_";
+const STORAGE_CATEGORIES = [
+  { label: "スレッド", key: K.threads },
+  { label: "記録", key: K.memories },
+  { label: "回想録", key: K.retrospects },
+  { label: "手控え", key: K.notes },
+  { label: "帳簿", key: K.ledgers },
+];
+const STORAGE_WARN_PCT = 80;
+const STORAGE_CRITICAL_PCT = 90;
+
+function measureStorage() {
+  const out = { total: 0, shiori: 0, others: 0, byCat: {}, otherShiori: 0 };
+  STORAGE_CATEGORIES.forEach((c) => { out.byCat[c.key] = 0; });
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key === null) continue;
+      const value = localStorage.getItem(key) || "";
+      const size = key.length + value.length;
+      out.total += size;
+      if (!key.startsWith(STORAGE_PREFIX)) { out.others += size; continue; }
+      out.shiori += size;
+      if (out.byCat[key] !== undefined) out.byCat[key] += size;
+      else out.otherShiori += size;
+    }
+  } catch (e) {
+    console.warn("[書斎] 使用量を測れなかった", e);
+  }
+  out.pct = (out.total / STORAGE_LIMIT_CHARS) * 100;
+  return out;
+}
+
+// 「約 1.2MB 相当」の数値部分（文字数を 1MB＝1,048,576 文字として換算。上限の目安 5,242,880 文字が 5MB になる）
+function formatStorageMB(chars) {
+  return (chars / 1048576).toFixed(1);
+}
+
+function formatStoragePct(pct) {
+  return pct > 0 && pct < 1 ? pct.toFixed(1) : String(Math.round(pct));
 }
 
 function extractPlainText(content) {
@@ -1738,7 +1855,7 @@ function resolveBlock2({ room, thread, memories, retrospects, notes, touch = tru
 
 // 控えを捨てる（次の送信で作り直す）。roomId を渡せばその部屋のスレッドだけ、省略で全部
 function invalidateBlock2(roomId) {
-  if (roomId === undefined) { localStorage.removeItem(K.block2Snapshots); return; }
+  if (roomId === undefined) { safeRemoveItem(K.block2Snapshots); return; }
   const snaps = loadJSON(K.block2Snapshots, {});
   Object.keys(snaps).forEach((id) => { if (snaps[id] && snaps[id].roomId === roomId) delete snaps[id]; });
   saveJSON(K.block2Snapshots, snaps);
@@ -1803,6 +1920,66 @@ function ErrorBox({ error }) {
           <pre>{error.raw}</pre>
         </details>
       )}
+    </div>
+  );
+}
+
+/* ===== 保存の失敗の帯 ===== */
+
+// 画面上部に出し続ける帯。失敗したキーがどれも保存できる（または消える）まで消えない。
+// 帯の高さを --save-band-h に入れ、固定ヘッダー（.topbar）を帯の下にずらす
+function SaveFailureBand({ failure, onOpenSettings }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const root = document.documentElement;
+    const update = () => { if (ref.current) root.style.setProperty("--save-band-h", `${ref.current.offsetHeight}px`); };
+    update();
+    const ro = typeof ResizeObserver === "function" ? new ResizeObserver(update) : null;
+    if (ro && ref.current) ro.observe(ref.current);
+    return () => { if (ro) ro.disconnect(); root.style.removeProperty("--save-band-h"); };
+  }, []);
+  return (
+    <div className="save-band" ref={ref} role="alert">
+      <div className="save-band-inner">
+        <div className="save-band-text">
+          {failure.quota
+            ? "保存できなかった。置き場がいっぱいになっている。いま画面に見えている内容は、再読み込みすると消える。設定からバックアップを書き出してほしい。"
+            : "保存できなかった。いま画面に見えている内容は、再読み込みすると消えるかもしれない。"}
+          {!failure.quota && failure.detail && <div className="save-band-detail">{failure.detail}</div>}
+        </div>
+        {onOpenSettings && <button className="save-band-link" onClick={onOpenSettings}>設定を開く</button>}
+      </div>
+    </div>
+  );
+}
+
+/* ===== 置き場の使用量（設定画面） ===== */
+
+function StorageMeter() {
+  const [m] = useState(() => measureStorage()); // 設定画面を開いたときに測る（常時の監視はしない）
+  const fmtChars = (n) => `${n.toLocaleString()} 字`;
+  const row = (label, chars, sub) => (
+    <div className={`kv-row storage-row${sub ? " storage-sub" : ""}`} key={label}>
+      <span>{label}</span>
+      <span>約 {formatStorageMB(chars)}MB 相当（{fmtChars(chars)}）</span>
+    </div>
+  );
+  const pct = m.pct;
+  return (
+    <div className="settings-block">
+      <h2>置き場の使用量</h2>
+      <div className="storage-total">
+        約 {formatStorageMB(m.total)}MB 相当 / 目安 5MB（{formatStoragePct(pct)}%）
+      </div>
+      <div className={`storage-bar${pct > STORAGE_CRITICAL_PCT ? " critical" : pct > STORAGE_WARN_PCT ? " warn" : ""}`}>
+        <div style={{ width: `${Math.min(100, pct)}%` }} />
+      </div>
+      {row("栞の分", m.shiori)}
+      {STORAGE_CATEGORIES.map((c) => row(c.label, m.byCat[c.key], true))}
+      {row("その他", m.otherShiori, true)}
+      {row("それ以外（同じ置き場の他のアプリ）", m.others)}
+      <div className="spend-note">同じ場所に置いた他のアプリ（nagiChat など）と、この容量を分け合っている</div>
+      <div className="spend-note">数字は文字数から出した目安。実際の上限はブラウザによって違う。</div>
     </div>
   );
 }
@@ -2393,6 +2570,7 @@ function JottedLine({ jotted }) {
 
 function ConversationScreen({
   apiKey, building, room, thread, memories, retrospects, notes, ledger, priceTable,
+  storageWarning, onDismissStorageWarning, onOpenSettings,
   onBack, onUpdateThread, onAddNotes, onRecordSpend, onOpenBundleMemory, onOpenMemories,
 }) {
   const [draft, setDraft] = useState("");
@@ -2466,7 +2644,9 @@ function ConversationScreen({
       jumpedRef.current = true;
       const el = lastAssistantRef.current;
       const topbar = document.querySelector(".topbar");
-      if (topbar) el.style.scrollMarginTop = `${topbar.offsetHeight + 8}px`;
+      // 保存の失敗の帯が出ていれば、その高さも足す（固定ヘッダーは帯の下に止まるため）
+      const bandH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--save-band-h")) || 0;
+      if (topbar) el.style.scrollMarginTop = `${topbar.offsetHeight + bandH + 8}px`;
       el.scrollIntoView({ block: "start" });
       return;
     }
@@ -2496,7 +2676,15 @@ function ConversationScreen({
   }, [streamText, streamThinking]);
 
   // 送信処理の共通部分。nextMessages の末尾は送信するユーザー発言であること。
-  async function sendToModel(nextMessages) {
+  // 先に自分の発言を保存し、保存できなかったら送信しない（お金をかけない）。帯は保存処理（safeSetItem）が出す。
+  // 送信を始めたら true、保存に失敗して送らなかったら false を返す（呼び出し側は false なら入力欄の文章を残す）
+  function sendToModel(nextMessages) {
+    if (!onUpdateThread({ ...thread, messages: nextMessages }, { requireSaved: true })) return false;
+    runSend(nextMessages);
+    return true;
+  }
+
+  async function runSend(nextMessages) {
     setError(null);
     setBundleNotice(null);
     setSendNotice(null);
@@ -2504,7 +2692,6 @@ function ConversationScreen({
     jumpPendingRef.current = false;
     followRef.current = true;
     resetStream();
-    onUpdateThread({ ...thread, messages: nextMessages });
     setSending(true);
     // この送信で払った分（周ごと）。保存できた応答は「通常送信」、空応答・エラーで保存しなかった応答は「破棄」として帳簿に記録する
     const spentRounds = [];
@@ -2574,6 +2761,7 @@ function ConversationScreen({
       saved = true;
       jumpPendingRef.current = true;
       streamedTsRef.current = assistantMessage.ts;
+      // 保存に失敗しても返事は画面に出したままにする（帯で知らせる。帳簿は料金が実際にかかっているので「通常送信」で記録を試みる）
       onUpdateThread({ ...thread, messages: [...nextMessages, assistantMessage] });
       if (json.truncated) {
         setError(new ShosaiError(`ツールの呼び出しが続きすぎたので、途中で打ち切った（上限${TOOL_LOOP_MAX}回）。ここまでの返事と手控えは残してある。`));
@@ -2590,9 +2778,9 @@ function ConversationScreen({
   function handleSend() {
     const text = draft.trim();
     if (!text || sending) return;
-    setDraft("");
     const userMessage = { role: "user", content: text, ts: nowISO() };
-    sendToModel([...thread.messages, userMessage]);
+    // 保存できなかったら送らず、入力欄の文章も残す
+    if (sendToModel([...thread.messages, userMessage])) setDraft("");
   }
 
   function startEdit(index) {
@@ -2620,10 +2808,9 @@ function ConversationScreen({
   function doResend(index) {
     const text = editText.trim();
     setConfirmResend(null);
-    cancelEdit();
-    // 編集後の発言は再送信した時刻で作り直す
+    // 編集後の発言は再送信した時刻で作り直す。保存できなかったら送らず、編集中の文章も残す
     const userMessage = { role: "user", content: text, ts: nowISO() };
-    sendToModel([...thread.messages.slice(0, index), userMessage]);
+    if (sendToModel([...thread.messages.slice(0, index), userMessage])) cancelEdit();
   }
 
   function handleSaveLog(format) {
@@ -2683,6 +2870,18 @@ function ConversationScreen({
           )}
         </div>
       </div>
+
+      {storageWarning && (
+        <div className="storage-warning">
+          <span className="storage-warning-text" onClick={onOpenSettings}>
+            {storageWarning.critical
+              ? `置き場がほぼいっぱい（${formatStoragePct(storageWarning.pct)}%）。`
+              : `置き場が残り少ない（${formatStoragePct(storageWarning.pct)}%）。`}
+            設定からバックアップを書き出して、古いスレッドを整理してほしい。
+          </span>
+          <button className="storage-warning-close" onClick={onDismissStorageWarning} aria-label="閉じる">×</button>
+        </div>
+      )}
 
       <div className="messages">
         {thread.messages.length === 0 && !sending && (
@@ -3177,6 +3376,8 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
         <ErrorBox error={importError} />
       </div>
 
+      <StorageMeter />
+
       <div className="settings-block">
         <h2>書き付けの掃除</h2>
         <div className="kv-row">
@@ -3267,7 +3468,8 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
           requireDouble
           confirmLabel="置き換える"
           onCancel={() => setPendingBackup(null)}
-          onConfirm={() => onRestoreBackup(pendingBackup)}
+          // 書き込めなかったときは再読み込みしないので、ダイアログを閉じて帯を見せる
+          onConfirm={() => { if (onRestoreBackup(pendingBackup) === false) setPendingBackup(null); }}
         />
       )}
     </div>
@@ -3351,39 +3553,76 @@ function App() {
     document.documentElement.dataset.theme = theme;
     const themeMeta = document.querySelector('meta[name="theme-color"]');
     if (themeMeta) themeMeta.setAttribute("content", theme === "dark" ? "#352A2D" : "#EBDCD0");
-    localStorage.setItem(K.theme, theme);
+    safeSetItem(K.theme, theme);
   }, [theme]);
 
-  function setBuildings(next) { setBuildingsState(next); saveJSON(K.buildings, next); }
-  function setRooms(next) { setRoomsState(next); saveJSON(K.rooms, next); }
-  function setThreads(next) { setThreadsState(next); saveJSON(K.threads, next); }
-  function setMemories(next) { setMemoriesState(next); saveJSON(K.memories, next); }
-  function setRetrospects(next) { setRetrospectsState(next); saveJSON(K.retrospects, next); }
-  function setNotes(next) { setNotesState(next); saveJSON(K.notes, next); }
-  function setLedgers(next) { setLedgersState(next); saveJSON(K.ledgers, next); }
-  function setPriceTable(next) { setPriceTableState(next); saveJSON(K.prices, next); }
-  function resetPriceTable() { localStorage.removeItem(K.prices); setPriceTableState(DEFAULT_PRICE_TABLE); }
+  // いまメモリにある最新の状態。送信など非同期で終わる処理は、レンダー時点の値ではなくここから読む。
+  // （以前は localStorage から読み直していたが、保存に失敗していると画面にだけある内容を取りこぼすため）
+  const latestRef = useRef({});
+  latestRef.current = { buildings, rooms, threads, memories, retrospects, notes, ledgers, priceTable };
 
-  // 帳簿の無いスレッドに、保存済みの発言から帳簿を作って入れる（一度だけ）。ledgersData を書き換えて、作ったかを返す
+  // 保存の失敗（帯に出す）。失敗はアプリ起動前（初期データの書き込み等）にも起こり得るので、購読時に今の状態を取り直す
+  const [saveFailure, setSaveFailure] = useState(() => saveFailureSnapshot());
+  useEffect(() => {
+    saveFailureListeners.add(setSaveFailure);
+    setSaveFailure(saveFailureSnapshot());
+    return () => { saveFailureListeners.delete(setSaveFailure); };
+  }, []);
+
+  // 置き場の使用量の予告。アプリ起動時（バックアップ復元後の再読み込みを含む）とスレッドを開いたときだけ測る
+  const [storagePct, setStoragePct] = useState(() => measureStorage().pct);
+  const [warnDismissed, setWarnDismissed] = useState(false); // 80% の予告：×で閉じたらこの起動中は出さない
+  const [criticalDismissed, setCriticalDismissed] = useState(false); // 90% の予告：閉じても次にスレッドを開いたらまた出す
+  useEffect(() => {
+    if (route.screen !== "conversation" || !route.threadId) return;
+    setStoragePct(measureStorage().pct);
+    setCriticalDismissed(false);
+  }, [route.screen, route.threadId]);
+
+  // 状態を更新して保存する。保存できたかを返す。
+  // requireSaved: true のときは、保存に失敗したら状態も変えない（自分の発言の保存失敗時に、送信も表示もしないため）
+  function persistState(key, setState, field, next, opts = {}) {
+    const ok = saveJSON(key, next);
+    if (!ok && opts.requireSaved) return false;
+    latestRef.current = { ...latestRef.current, [field]: next };
+    setState(next);
+    return ok;
+  }
+  function setBuildings(next) { return persistState(K.buildings, setBuildingsState, "buildings", next); }
+  function setRooms(next) { return persistState(K.rooms, setRoomsState, "rooms", next); }
+  function setThreads(next, opts) { return persistState(K.threads, setThreadsState, "threads", next, opts); }
+  function setMemories(next) { return persistState(K.memories, setMemoriesState, "memories", next); }
+  function setRetrospects(next) { return persistState(K.retrospects, setRetrospectsState, "retrospects", next); }
+  function setNotes(next) { return persistState(K.notes, setNotesState, "notes", next); }
+  function setLedgers(next) { return persistState(K.ledgers, setLedgersState, "ledgers", next); }
+  function setPriceTable(next) { return persistState(K.prices, setPriceTableState, "priceTable", next); }
+  function resetPriceTable() {
+    safeRemoveItem(K.prices);
+    latestRef.current = { ...latestRef.current, priceTable: DEFAULT_PRICE_TABLE };
+    setPriceTableState(DEFAULT_PRICE_TABLE);
+  }
+
+  // 帳簿の無いスレッドに、発言から帳簿を作って入れる（一度だけ）。ledgersData を書き換えて、作ったかを返す
   function ensureThreadLedger(ledgersData, threadId) {
     if (Array.isArray(ledgersData.threads[threadId])) return false;
-    const t = loadJSON(K.threads, []).find((x) => x.id === threadId);
+    const cur = latestRef.current;
+    const t = cur.threads.find((x) => x.id === threadId);
     if (!t) return false;
-    const r = loadJSON(K.rooms, []).find((x) => x.id === t.roomId);
-    const b = r && loadJSON(K.buildings, []).find((x) => x.id === r.buildingId);
+    const r = cur.rooms.find((x) => x.id === t.roomId);
+    const b = r && cur.buildings.find((x) => x.id === r.buildingId);
     ledgersData.threads[threadId] = ledgerFromMessages(t, b ? b.model : null);
     return true;
   }
 
   // 支出を帳簿に記録する。rounds は API を呼んだ回ごとの { model, usage }。
   // threadId のスレッドがあればそこへ、無ければ（スレッドを開かずに編んだ等）roomId の部屋の帳簿へ。
-  // 送信は非同期で終わるため、レンダー時点の ledgers ではなく保存済みの最新に足す。発言が消えても帳簿からは消さない
+  // 送信は非同期で終わるため、レンダー時点の ledgers ではなくメモリ上の最新（latestRef）に足す。発言が消えても帳簿からは消さない
   function recordSpend({ threadId, roomId }, kind, rounds) {
     const list = (rounds || []).filter((r) => r && r.usage);
     if (list.length === 0) return;
     const ts = nowISO();
     const entries = list.map((r) => ({ ts, kind, model: r.model || null, usage: r.usage }));
-    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    const next = normalizeLedgers(latestRef.current.ledgers);
     if (threadId && (Array.isArray(next.threads[threadId]) || ensureThreadLedger(next, threadId))) {
       next.threads[threadId] = [...next.threads[threadId], ...entries];
     } else if (roomId) {
@@ -3395,39 +3634,52 @@ function App() {
   // 帳簿の無い既存スレッドを開いたら、過去の発言の usage から帳簿を作る（一度だけ）
   useEffect(() => {
     if (route.screen !== "conversation" || !route.threadId) return;
-    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    const next = normalizeLedgers(latestRef.current.ledgers);
     if (ensureThreadLedger(next, route.threadId)) setLedgers(next);
   }, [route.screen, route.threadId]);
 
   // 消えたスレッド・部屋の帳簿を片づける
   function pruneLedgers({ threadIds = [], roomIds = [] }) {
-    const next = normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS));
+    const next = normalizeLedgers(latestRef.current.ledgers);
     threadIds.forEach((id) => delete next.threads[id]);
     roomIds.forEach((id) => delete next.rooms[id]);
     setLedgers(next);
   }
-  // 全データのバックアップを書き出す。APIキー・テーマ・lastThreadId は含めない
+  // 全データのバックアップを書き出す。APIキー・テーマ・lastThreadId は含めない。
+  // localStorage ではなく、いまメモリにある状態から作る（置き場が満杯で保存できず、画面にだけ残っている返事も書き出すため）
   function exportBackup(suffix) {
+    const cur = latestRef.current;
     const data = {
-      app: "shiori", version: 1, exportedAt: nowISO(), buildings, rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []),
-      ledgers: normalizeLedgers(loadJSON(K.ledgers, EMPTY_LEDGERS)),
-      prices: loadJSON(K.prices, null), // 単価を編集していなければ null（初期値のまま）
+      app: "shiori", version: 1, exportedAt: nowISO(),
+      buildings: cur.buildings, rooms: cur.rooms, threads: cur.threads, memories: cur.memories, retrospects: cur.retrospects, notes: cur.notes,
+      ledgers: normalizeLedgers(cur.ledgers),
+      prices: cur.priceTable === DEFAULT_PRICE_TABLE ? null : cur.priceTable, // 単価を編集していなければ null（初期値のまま）
     };
     const name = suffix ? `shiori_backup_${todayYMD()}_${suffix}.json` : `shiori_backup_${todayYMD()}.json`;
     downloadFile(name, JSON.stringify(data, null, 2), "application/json");
   }
-  // 手控えの追記。送信は非同期で終わるため、レンダー時点の notes ではなく保存済みの最新から足す。
+  // 手控えの追記。送信は非同期で終わるため、レンダー時点の notes ではなくメモリ上の最新（latestRef）に足す。
   function addNotes(roomId, texts) {
     const ts = nowISO();
     const added = texts.map((text) => ({ id: uid(), roomId, text, createdAt: ts }));
-    setNotes([...loadJSON(K.notes, []), ...added]);
+    setNotes([...latestRef.current.notes, ...added]);
   }
 
+  // 画面上部の帯（保存の失敗）。どの画面でも、その画面の上に出す
+  const saveBand = saveFailure && (
+    <SaveFailureBand
+      failure={saveFailure}
+      onOpenSettings={route.screen === "settings" ? null : () => navigate({ screen: "settings" })}
+    />
+  );
+  return <>{saveBand}{renderScreen()}</>;
+
+  function renderScreen() {
   if (!apiKey) {
     return (
       <ApiKeyGate
         onSave={(key) => {
-          localStorage.setItem(K.apiKey, key);
+          safeSetItem(K.apiKey, key);
           setApiKey(key);
         }}
       />
@@ -3469,8 +3721,8 @@ function App() {
         onChangePrices={setPriceTable}
         onResetPrices={resetPriceTable}
         onBack={goBack}
-        onSaveApiKey={(key) => { localStorage.setItem(K.apiKey, key); setApiKey(key); }}
-        onDeleteApiKey={() => { localStorage.removeItem(K.apiKey); setApiKey(""); }}
+        onSaveApiKey={(key) => { safeSetItem(K.apiKey, key); setApiKey(key); }}
+        onDeleteApiKey={() => { safeRemoveItem(K.apiKey); setApiKey(""); }}
         onToggleTheme={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
         onWipeAll={() => {
           Object.values(K).forEach((k) => localStorage.removeItem(k));
@@ -3481,7 +3733,7 @@ function App() {
         onRunJotCleanup={() => {
           // 実行前に必ず全データのバックアップを書き出す。失敗したら掃除しない
           exportBackup("before_cleanup");
-          const plan = planTextualJotCleanup({ rooms, threads, memories, retrospects, notes: loadJSON(K.notes, []) });
+          const plan = planTextualJotCleanup({ rooms, threads, memories, retrospects, notes: latestRef.current.notes });
           setThreads(plan.next.threads);
           setMemories(plan.next.memories);
           setRetrospects(plan.next.retrospects);
@@ -3491,21 +3743,26 @@ function App() {
         }}
         onRestoreBackup={(data) => {
           // 全置き換え。APIキーとテーマには触らない
-          saveJSON(K.buildings, data.buildings);
-          saveJSON(K.rooms, data.rooms);
-          saveJSON(K.threads, normalizeThreadMessages(data.threads));
-          saveJSON(K.memories, data.memories);
-          // 回想録キーの無い旧バックアップも読み込める
-          saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {});
-          // 手控えキーの無い旧バックアップも読み込める
-          saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []);
-          // 帳簿キーの無い旧バックアップも読み込める（各スレッドを開いたときに発言から作り直す）
-          saveJSON(K.ledgers, normalizeLedgers(data.ledgers));
-          // 単価を編集したバックアップなら単価も戻す。無ければ今の単価のまま
-          if (Array.isArray(data.prices)) saveJSON(K.prices, data.prices);
-          localStorage.removeItem(K.lastThreadId);
+          const results = [
+            saveJSON(K.buildings, data.buildings),
+            saveJSON(K.rooms, data.rooms),
+            saveJSON(K.threads, normalizeThreadMessages(data.threads)),
+            saveJSON(K.memories, data.memories),
+            // 回想録キーの無い旧バックアップも読み込める
+            saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {}),
+            // 手控えキーの無い旧バックアップも読み込める
+            saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []),
+            // 帳簿キーの無い旧バックアップも読み込める（各スレッドを開いたときに発言から作り直す）
+            saveJSON(K.ledgers, normalizeLedgers(data.ledgers)),
+            // 単価を編集したバックアップなら単価も戻す。無ければ今の単価のまま
+            Array.isArray(data.prices) ? saveJSON(K.prices, data.prices) : true,
+          ];
+          safeRemoveItem(K.lastThreadId);
           invalidateBlock2(); // データを丸ごと入れ替えたので控えも捨てる
+          // 1つでも書き込めなかったら再読み込みしない（帯を出したまま、画面の内容を書き出せるようにしておく）
+          if (results.some((ok) => !ok)) return false;
           window.location.reload();
+          return true;
         }}
       />
     );
@@ -3582,6 +3839,13 @@ function App() {
     return (
       <ConversationScreen
         apiKey={apiKey}
+        storageWarning={
+          storagePct > STORAGE_CRITICAL_PCT ? (criticalDismissed ? null : { pct: storagePct, critical: true })
+            : storagePct > STORAGE_WARN_PCT ? (warnDismissed ? null : { pct: storagePct, critical: false })
+              : null
+        }
+        onDismissStorageWarning={() => (storagePct > STORAGE_CRITICAL_PCT ? setCriticalDismissed(true) : setWarnDismissed(true))}
+        onOpenSettings={() => navigate({ screen: "settings" })}
         building={building}
         room={room}
         thread={thread}
@@ -3593,9 +3857,8 @@ function App() {
         priceTable={priceTable}
         onRecordSpend={(kind, rounds) => recordSpend({ threadId: thread.id, roomId: room.id }, kind, rounds)}
         onBack={goBack}
-        onUpdateThread={(updated) => {
-          setThreads(threads.map((t) => (t.id === updated.id ? updated : t)));
-        }}
+        // 保存できたかを返す。opts.requireSaved（自分の発言）なら、保存に失敗したときは画面も変えない
+        onUpdateThread={(updated, opts) => setThreads(latestRef.current.threads.map((t) => (t.id === updated.id ? updated : t)), opts)}
         onAddNotes={(texts) => addNotes(room.id, texts)}
         // threadId を持たせて、記録帳で編んだときの編み代をこのスレッドに計上する
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id, threadId: thread.id })}
@@ -3654,7 +3917,7 @@ function App() {
         threads={roomThreads}
         onBack={goBack}
         onOpenThread={(threadId) => {
-          localStorage.setItem(K.lastThreadId, threadId);
+          safeSetItem(K.lastThreadId, threadId);
           navigate({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId });
         }}
         onCreateThread={() => {
@@ -3662,7 +3925,7 @@ function App() {
           const label = formatDateJP(ts);
           const newThread = { id: uid(), roomId: room.id, title: label, createdAt: ts, frozenDate: label, messages: [] };
           setThreads([...threads, newThread]);
-          localStorage.setItem(K.lastThreadId, newThread.id);
+          safeSetItem(K.lastThreadId, newThread.id);
           navigate({ screen: "conversation", buildingId: building.id, roomId: room.id, threadId: newThread.id });
         }}
         onRenameThread={(threadId, title) => {
@@ -3672,7 +3935,7 @@ function App() {
           setThreads(threads.filter((t) => t.id !== threadId));
           pruneLedgers({ threadIds: [threadId] });
           setMemories(memories); // 記録帳はスレッド削除では消えない(部屋単位のため)
-          if (localStorage.getItem(K.lastThreadId) === threadId) localStorage.removeItem(K.lastThreadId);
+          if (localStorage.getItem(K.lastThreadId) === threadId) safeRemoveItem(K.lastThreadId);
         }}
         onOpenMemories={() => navigate({ screen: "memories", buildingId: building.id, roomId: room.id })}
       />
@@ -3711,7 +3974,7 @@ function App() {
             delete nextRetrospects[roomId];
             setRetrospects(nextRetrospects);
           }
-          if (doomedThreadIds.has(localStorage.getItem(K.lastThreadId))) localStorage.removeItem(K.lastThreadId);
+          if (doomedThreadIds.has(localStorage.getItem(K.lastThreadId))) safeRemoveItem(K.lastThreadId);
         }}
       />
     );
@@ -3743,10 +4006,11 @@ function App() {
         const nextRetrospects = { ...retrospects };
         doomedRoomIds.forEach((id) => delete nextRetrospects[id]);
         setRetrospects(nextRetrospects);
-        if (doomedRoomIds.size > 0) localStorage.removeItem(K.lastThreadId);
+        if (doomedRoomIds.size > 0) safeRemoveItem(K.lastThreadId);
       }}
     />
   );
+  }
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
