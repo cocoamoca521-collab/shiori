@@ -698,6 +698,41 @@ function saveJSON(key, value) {
   return safeSetItem(key, JSON.stringify(value));
 }
 
+// バックアップの復元用：writes（[key, value] の並び）を順に書き込む。書き込む前に全キーの今の値（生の文字列。無いキーは null）を控え、
+// 1つでも失敗したら、控えた値を全キーに書き戻す（無かったキーは消す）。
+// 書き戻せたら、復元で起きた失敗は帯に出さない（保存の失敗の記録を復元前の状態に戻す）。書き戻しも失敗したときだけ帯を残す。
+// 返り値：{ ok: true } / { ok: false, rolledBack: true|false }
+function restoreWithRollback(writes) {
+  const keys = writes.map(([key]) => key);
+  let before;
+  try {
+    before = keys.map((key) => [key, localStorage.getItem(key)]);
+  } catch (e) {
+    markSaveFailed(keys[0], e); // 読めなければ何も書き込まない
+    return { ok: false, rolledBack: false };
+  }
+  const failuresBefore = new Map(saveFailures); // 復元前から残っていた失敗（画面にだけある内容）は、書き戻せても消さない
+  const allWritten = writes.every(([key, value]) => saveJSON(key, value)); // 失敗したところで止める
+  if (allWritten) return { ok: true };
+  let rolledBack = true;
+  before.forEach(([key, raw]) => {
+    try {
+      if (raw === null) localStorage.removeItem(key);
+      else localStorage.setItem(key, raw);
+    } catch (e) {
+      rolledBack = false;
+      markSaveFailed(key, e);
+    }
+  });
+  if (rolledBack) {
+    saveFailures.clear();
+    failuresBefore.forEach((v, k) => saveFailures.set(k, v));
+    notifySaveFailure();
+  }
+  console.warn(`[書斎] 復元できなかった。書き戻し${rolledBack ? "できた" : "も失敗した"}`);
+  return { ok: false, rolledBack };
+}
+
 /* ----- 置き場の使用量（目安） -----
    localStorage の全キーの「キーの文字数＋値の文字数」の合計（文字数ベース）。同じオリジン（GitHub Pages の同じアカウント）の
    他のアプリの分も含む。上限はブラウザで違うので、Chrome 系の 10MB を UTF-16 の文字数に直した値を目安にする。
@@ -3468,8 +3503,14 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
           requireDouble
           confirmLabel="置き換える"
           onCancel={() => setPendingBackup(null)}
-          // 書き込めなかったときは再読み込みしないので、ダイアログを閉じて帯を見せる
-          onConfirm={() => { if (onRestoreBackup(pendingBackup) === false) setPendingBackup(null); }}
+          // 書き込めなかったときは再読み込みしないので、ダイアログを閉じる。
+          // 書き戻せたなら（データは復元前のまま）ここで知らせる。書き戻しも失敗したら帯（SaveFailureBand）が出ている
+          onConfirm={() => {
+            const r = onRestoreBackup(pendingBackup);
+            if (r && r.ok) return;
+            setPendingBackup(null);
+            if (r && r.rolledBack) setImportError({ message: "復元できなかった（置き場が足りない）。データは復元前のままになっている。" });
+          }}
         />
       )}
     </div>
@@ -3743,26 +3784,27 @@ function App() {
         }}
         onRestoreBackup={(data) => {
           // 全置き換え。APIキーとテーマには触らない
-          const results = [
-            saveJSON(K.buildings, data.buildings),
-            saveJSON(K.rooms, data.rooms),
-            saveJSON(K.threads, normalizeThreadMessages(data.threads)),
-            saveJSON(K.memories, data.memories),
+          const writes = [
+            [K.buildings, data.buildings],
+            [K.rooms, data.rooms],
+            [K.threads, normalizeThreadMessages(data.threads)],
+            [K.memories, data.memories],
             // 回想録キーの無い旧バックアップも読み込める
-            saveJSON(K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {}),
+            [K.retrospects, data.retrospects && typeof data.retrospects === "object" ? data.retrospects : {}],
             // 手控えキーの無い旧バックアップも読み込める
-            saveJSON(K.notes, Array.isArray(data.notes) ? data.notes : []),
+            [K.notes, Array.isArray(data.notes) ? data.notes : []],
             // 帳簿キーの無い旧バックアップも読み込める（各スレッドを開いたときに発言から作り直す）
-            saveJSON(K.ledgers, normalizeLedgers(data.ledgers)),
-            // 単価を編集したバックアップなら単価も戻す。無ければ今の単価のまま
-            Array.isArray(data.prices) ? saveJSON(K.prices, data.prices) : true,
+            [K.ledgers, normalizeLedgers(data.ledgers)],
           ];
+          // 単価を編集したバックアップなら単価も戻す。無ければ今の単価のまま
+          if (Array.isArray(data.prices)) writes.push([K.prices, data.prices]);
+          const result = restoreWithRollback(writes);
+          if (!result.ok) return result;
+          // 全部書き込めたときだけ、最後に開いたスレッドと block2 の控えを捨てて読み込み直す
           safeRemoveItem(K.lastThreadId);
           invalidateBlock2(); // データを丸ごと入れ替えたので控えも捨てる
-          // 1つでも書き込めなかったら再読み込みしない（帯を出したまま、画面の内容を書き出せるようにしておく）
-          if (results.some((ok) => !ok)) return false;
           window.location.reload();
-          return true;
+          return result;
         }}
       />
     );
