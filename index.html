@@ -284,6 +284,7 @@
   .price-grid input { padding: 6px 6px; font-size: 13px; border-radius: 8px; }
   @media (max-width: 480px) { .price-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .usage-line { color: var(--faint); font-size: 11px; margin-top: 6px; font-family: "Zen Kaku Gothic New", sans-serif; }
+  .usage-rounds { font-size: 9px; margin-right: 6px; opacity: 0.85; }
   .spend-notice { white-space: pre-wrap; }
   /* 思考：usage 行の行末の開閉と、展開した本文（プレーンテキスト・控えめな薄い帯） */
   .usage-row { display: flex; flex-wrap: wrap; align-items: center; column-gap: 8px; row-gap: 4px; }
@@ -2561,7 +2562,8 @@ function TranslateButton({ text }) {
 // stopReason が end_turn 以外のときだけ、行頭にその値を添える。cost（messageCost の結果）があれば末尾に金額を添える。
 // thinking（保存した思考の本文）があれば行末に「思考 ▸」を置き、タップでこの行の下に展開する（初期値は常に畳む。開閉は保存しない）
 // deferred（手控えを後払いにして終えた発言）なら、stopReason が "tool_use" でも正常終了として行頭に何も添えない
-function UsageLine({ usage, stopReason, deferred, cost, thinking }) {
+// roundCount（1ターンでリクエストした回数）が2以上なら、行頭に「×2」のように小さく添える（表示専用）
+function UsageLine({ usage, stopReason, deferred, roundCount, cost, thinking }) {
   const [thinkingOpen, setThinkingOpen] = useState(false);
   if (!usage) return null;
   const fmt = (n) => (n || 0).toLocaleString();
@@ -2573,11 +2575,12 @@ function UsageLine({ usage, stopReason, deferred, cost, thinking }) {
   const prefix = stopReason && stopReason !== "end_turn" && !(deferred && stopReason === "tool_use") ? `${stopReason} ─ ` : "";
   const costText = !cost ? "" : cost.unpriced ? " ・ 単価未設定" : ` ・ ${formatUSD(cost.total)}`;
   const hasThinking = typeof thinking === "string" && thinking.trim() !== "";
-  if (!hasThinking) return <div className="usage-line">{prefix}{text}{costText}</div>;
+  const rounds = roundCount >= 2 ? <span className="usage-rounds">×{roundCount}</span> : null;
+  if (!hasThinking) return <div className="usage-line">{rounds}{prefix}{text}{costText}</div>;
   return (
     <>
       <div className="usage-line usage-row">
-        <span>{prefix}{text}{costText}</span>
+        <span>{rounds}{prefix}{text}{costText}</span>
         <button className="thinking-toggle" onClick={() => setThinkingOpen((v) => !v)}>思考 {thinkingOpen ? "▾" : "▸"}</button>
         {thinkingOpen && <TranslateButton text={thinking} />}
       </div>
@@ -3045,7 +3048,7 @@ function ConversationScreen({
               </div>
             )}
             {m.role === "assistant" && <JottedLine jotted={m.jotted} />}
-            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} deferred={!!m.jotDeferred} cost={messageCost(m, building.model, ttl, priceTable)} thinking={m.thinking} />}
+            {m.role === "assistant" && <UsageLine usage={m.usage} stopReason={m.stopReason} deferred={!!m.jotDeferred} roundCount={Array.isArray(m.rounds) ? m.rounds.length : 1} cost={messageCost(m, building.model, ttl, priceTable)} thinking={m.thinking} />}
           </div>
           </React.Fragment>
           );
