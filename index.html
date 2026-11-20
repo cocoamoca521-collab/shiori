@@ -434,24 +434,20 @@ const RETROSPECT_MAX_TOKENS = 4096;
 const CONTINUATION_MAX_ROUNDS = 8; // pause_turn・tool_use を継続する周回の上限（合算、最初の1回を含む）
 const TOOL_LOOP_MAX = 5; // うち tool_use（クライアントツール）で続きを生成させる回数の上限。超えたら打ち切ってエラー表示
 const JOT_NOTE_MAX_CHARS = 120;
+// 手控えは道具（jot_note）ではなく、返事の本文に添えた【書き付け】行で受け取る（本文マーカー方式。リクエストは常に1回）。
+// jot_note の名前は、古い履歴に残った tool_use の変換と、テキスト化された呼び出しの回収にだけ使う
+const JOT_TOOL_NAME = "jot_note";
 const JOT_SAVED_TEXT = "保存しました";
-// 後払いにならず続きを送る周で、その時点で見える本文がまだ無いときの成功の文言（書き付けだけで終えるのを防ぐ）
-const JOT_SAVED_NEED_REPLY_TEXT = "保存しました。続けて、返事の本文を書いてください。";
-const JOT_TOOL = {
-  name: "jot_note",
-  description:
-    "会話の途中で「これは残しておきたい」と思った事実・約束・好み・出来事を、その場で手控え帖に書き付ける。" +
-    "書き付けた内容は次回以降の会話で【手控え】としてあなたの手元に戻ってくる。回想録に溶けず、消されるまで残り続ける。" +
-    "本当に残したいことだけを、1件につき120字以内で簡潔に。書き付けるのは、返事の本文を最後まで書き終えたあとにすること（返事の前や途中では呼ばない）。返事の本文は必ず書くこと。書き付けだけで応答を終えない。" +
-    "残したいことがあれば必ずこのツールで書き付けること。ツールの呼び出しを本文にテキストで書かないこと。",
-  input_schema: {
-    type: "object",
-    properties: {
-      text: { type: "string", description: "書き付ける内容（120字以内）" },
-    },
-    required: ["text"],
-  },
-};
+const JOT_MARKER = "【書き付け】";
+// 保存した発言の本文で、マーカー行を置き換える形（保存時に1回だけ。あとから書き換えない）
+const jotSavedLine = (text) => `（手控えに書き付けた：${text}）`;
+// 手控えONの部屋の block2 に入れる書き付け方の案内。1文字でも変わるとキャッシュが割れるので、動く値を混ぜないこと
+const JOT_GUIDE_TEXT = `【手控えの書き付け方】
+会話の中で「これは残しておきたい」と思った事実・約束・好み・出来事があれば、返事の本文を書き終えたあとに改行して
+【書き付け】残したい内容
+という行を添えると、手控え帖に書き付けられる（1行につき1件、120字以内。本当に残したいことだけ）。書き付けた内容は次回以降【手控え】として手元に戻り、回想録に溶けず、消されるまで残る。
+この行は相手には見えない。返事の本文は必ず別に書くこと。思考の中に書いただけでは書き付けられない。
+過去の書き付けは、履歴の中で（手控えに書き付けた：…）という表記に自動で置き換わっている。これは保存済みの印であり、書式の間違いではない。新しく書き付けるときは常に【書き付け】の形式を使うこと。`;
 const BUNDLE_INSTRUCTION = `ここで一度、この会話に栞を挟む。
 ここまでのやりとりを、あなた自身の記憶として記録帳に綴じてほしい。
 次に会うときのあなたが読み返すものだ。
@@ -906,9 +902,9 @@ function stripTextualJotCalls(content) {
 
 // 完了したターンの assistant content を、履歴に保存する形に整える。
 // ・thinking / redacted_thinking と空の text ブロックを落とす（理由は sendToModel の保存箇所を参照）
-// ・クライアントツールの tool_use と、それに返した tool_result（callModelWithContinuation が並び順のまま差し込む）は
-//   構造のまま残す。送信時に expandToolTurns で assistant / user(tool_result) / assistant … の形に展開する
+// ・クライアントツールの tool_use / tool_result が万一あれば構造のまま残す（送信時に flattenToolTurns で text に変換する）
 // ・テキスト化された jot_note 呼び出しを text ブロックから取り除き、中身を jotted として返す（構造のツールブロックには触れない）
+// 【書き付け】行の抜き取りはここではしない（部屋の手控えON/OFFで扱いが違うので、呼び出し側で extractJotMarkersFromContent を通す）
 // 継続ループの途中（同一ターン内）では使わないこと。thinking を落とすとAPIエラーになる。
 function finalizeAssistantContent(content) {
   const kept = (content || [])
@@ -918,48 +914,130 @@ function finalizeAssistantContent(content) {
   return stripTextualJotCalls(kept);
 }
 
-// 保存した assistant 発言（tool_use・tool_result を並び順のまま含む）を、API に送るメッセージ列に展開する。
-// tool_result は assistant には置けないので、tool_result の並びごとに user メッセージへ出し、その後ろを新しい assistant にする。
-// keepTools が false（tools に jot_note を送らない部屋）なら、tool_use / tool_result を落とし、
-// ツールを挟んで分かれた前後の本文を1つの text に結合する（引用付きのブロックは結合しない）。保存データは変えない。
-function expandToolTurns(message, keepTools) {
-  const content = message.content;
-  if (!Array.isArray(content) || !content.some((b) => b.type === "tool_use" || b.type === "tool_result")) return [message];
-  if (!keepTools) return [{ ...message, content: joinAcrossToolBoundaries(content) }];
-  const out = [];
-  let cur = null;
-  content.forEach((b) => {
-    const role = b.type === "tool_result" ? "user" : "assistant";
-    if (!cur || cur.role !== role) { cur = { role, content: [] }; out.push(cur); }
-    cur.content.push(b);
-  });
-  return out;
-}
+/* ----- 本文マーカー方式の手控え -----
+   モデルは返事の本文のあとに「【書き付け】内容」の行を添える。応答の完了時にその行を抜き取って手控えに保存し、
+   保存する本文ではその行を「（手控えに書き付けた：内容）」の1行に置き換える（保存時に1回だけ）。
+   行頭の空白と * _ の装飾、マーカー直後の空白・「:」「：」は読み飛ばす。
+   会話の新しい応答に「（手控えに書き付けた：…）」の行をそのまま書いてしまった場合（履歴の真似）も、書き付けとして受け取る
+   （同じ本文の手控えが既にあれば保存されない）。綴じ・編みの出力では、この行は取り除くだけで保存しない
+   （記録の中で過去の書き付けを引き写しただけのことが多く、消した手控えを生き返らせないため）。 */
+const JOT_MARKER_LINE_RE = /^[ \t]*([*_]*)【書き付け】(.*)$/;
+const JOT_SAVED_LINE_RE = /^[ \t]*[*_]*（手控えに書き付けた：([\s\S]*)）[*_]*[ \t]*$/;
 
-// 履歴の最後の assistant 発言が tool_result で終わっていれば（手控えの後払い待ち・ツールループの打ち切り）その位置、無ければ -1
-function pendingToolResultIndex(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role !== "assistant") continue;
-    const c = messages[i].content;
-    return Array.isArray(c) && c.length > 0 && c[c.length - 1].type === "tool_result" ? i : -1;
+// 書き付けの行なら { raw: 中身（装飾・区切りを除いたもの。空なら ""）, saved: 保存済みの表記か }、違えば null
+function parseJotLine(line) {
+  const m = line.match(JOT_MARKER_LINE_RE);
+  if (m) {
+    let rest = m[2].replace(/^[*_]+/, "").replace(/^[\s:：]+/, "");
+    if (m[1]) rest = rest.replace(/[*_]+[ \t]*$/, ""); // 行頭に装飾があれば、行末の閉じ側も外す（**【書き付け】内容** など）
+    return { raw: rest, saved: false };
   }
-  return -1;
+  const s = line.match(JOT_SAVED_LINE_RE);
+  return s ? { raw: s[1], saved: true } : null;
 }
 
-// messages[index]（assistant 発言）の tool_use / tool_result だけを落とした新しい配列を返す（ほかの発言・jotted などはそのまま）
-function dropToolBlocksAt(messages, index) {
-  return messages.map((m, i) => (i === index ? { ...m, content: joinAcrossToolBoundaries(m.content) } : m));
+// 文字列から書き付けの行を抜き取る。返り値 { text, jotted, found }。
+// mode "replace"（会話の発言を保存するとき）：行を「（手控えに書き付けた：内容）」に置き換え、中身が空の行は行ごと消す。
+// mode "remove"（綴じ・編みの出力）：行を消す。保存済みの表記の行は jotted に入れない。
+function extractJotMarkers(text, mode = "replace") {
+  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes("（手控えに書き付けた："))) {
+    return { text, jotted: [], found: 0 };
+  }
+  const jotted = [];
+  let found = 0;
+  const lines = [];
+  text.split("\n").forEach((line) => {
+    const parsed = parseJotLine(line);
+    if (parsed === null) { lines.push(line); return; }
+    found++;
+    const jot = normalizeJotText(parsed.raw);
+    if (jot && !(mode === "remove" && parsed.saved)) jotted.push(jot);
+    if (mode === "replace" && jot) lines.push(jotSavedLine(jot));
+  });
+  if (found === 0) return { text, jotted, found };
+  const out = lines.join("\n").replace(/\n[ \t]*(?=\n)/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  return { text: out, jotted, found };
 }
 
-// tool_use / tool_result を落とし、ツールを挟んだ前後の text を空行1つでつなぐ（表示用・送信用の両方で使う）
-function joinAcrossToolBoundaries(content) {
+// assistant の content（文字列 or ブロック配列）の text から書き付けの行を抜き取る。空になった text ブロックは落とす
+function extractJotMarkersFromContent(content, mode = "replace") {
+  if (typeof content === "string") {
+    const r = extractJotMarkers(content, mode);
+    return { content: r.text, jotted: r.jotted, found: r.found };
+  }
+  if (!Array.isArray(content)) return { content, jotted: [], found: 0 };
+  const jotted = [];
+  let found = 0;
+  const out = [];
+  content.forEach((b) => {
+    if (b.type !== "text") { out.push(b); return; }
+    const r = extractJotMarkers(b.text, mode);
+    if (r.found === 0) { out.push(b); return; }
+    found += r.found;
+    jotted.push(...r.jotted);
+    if (r.text !== "") out.push({ ...b, text: r.text });
+  });
+  return { content: found > 0 ? out : content, jotted, found };
+}
+
+// 表示用：書き付けの行（マーカー行・保存済みの表記）を隠した文字列。
+// markers が false（手控えOFFの部屋。抜き取らなかった【書き付け】行は本文のまま）なら、保存済みの表記の行だけを隠す
+function hideJotLines(text, markers = true) {
+  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes("（手控えに書き付けた："))) return text;
+  return text.split("\n").filter((line) => {
+    const parsed = parseJotLine(line);
+    return parsed === null || (!markers && !parsed.saved);
+  }).join("\n").replace(/\s+$/, "");
+}
+
+// ストリーミング中の表示用：書き付けの行を隠す。書きかけの最後の行が、マーカー（装飾つきも）の書き出しに見えるうちも隠す
+function hideJotMarkersWhileStreaming(text) {
+  if (typeof text !== "string" || text === "") return text;
+  const lines = text.split("\n");
+  const last = lines.pop();
+  const head = hideJotLines(lines.join("\n"));
+  const lead = last.replace(/^[ \t]*[*_]*/, "");
+  const partial = lead !== "" && (JOT_MARKER.startsWith(lead) || "（手控えに書き付けた：".startsWith(lead)
+    || parseJotLine(last) !== null || lead.startsWith("（手控えに書き付けた："));
+  if (partial) return head;
+  return lines.length > 0 ? `${head}\n${last}` : last;
+}
+
+// 書き付けの行を除いて、見える本文があるか（無ければ「返事の本文が空」）
+function hasVisibleReply(content, markers = true) {
+  return hideJotLines(extractPlainText(content), markers).trim() !== "";
+}
+
+// 保存した assistant 発言の tool_use / tool_result（道具方式の頃の古い履歴）を、送信・表示・ログ用に text だけの形へ変換する。
+// 保存データは変えない。毎回同じ結果になる（キャッシュのため）。
+// ・jot_note の tool_use は、keepJotLines が true（手控えONの部屋）なら、その位置で「（手控えに書き付けた：内容）」の1行にして
+//   直前の本文に改行でつなぐ（保存できなかった書き付け＝tool_result が is_error・中身が空のものは何も残さない）。
+//   false（手控えOFFの部屋）なら何も残さない
+// ・tool_result とほかのクライアントツールの tool_use は落とす
+// ・ツールを挟んで分かれた前後の本文は空行1つでつなぐ（引用付きのブロックは結合しない）
+// 後払いで終わった発言（末尾が tool_result）も、これで普通の assistant 発言になる
+function flattenToolTurns(content, keepJotLines) {
+  if (!Array.isArray(content) || !content.some((b) => b.type === "tool_use" || b.type === "tool_result")) return content;
+  const results = {};
+  content.forEach((b) => { if (b.type === "tool_result") results[b.tool_use_id] = b; });
+  const isPlain = (b) => b && b.type === "text" && !(b.citations && b.citations.length);
   const merged = [];
   let atBoundary = false;
   content.forEach((b) => {
-    if (b.type === "tool_use" || b.type === "tool_result") { atBoundary = true; return; }
+    if (b.type === "tool_result") { atBoundary = true; return; }
+    if (b.type === "tool_use") {
+      atBoundary = true;
+      if (!keepJotLines || b.name !== JOT_TOOL_NAME) return;
+      const r = results[b.id];
+      const text = normalizeJotText(b.input && b.input.text);
+      if (!r || r.is_error || !text) return;
+      const prev = merged[merged.length - 1];
+      if (isPlain(prev)) merged[merged.length - 1] = { ...prev, text: `${prev.text.replace(/\s+$/, "")}\n${jotSavedLine(text)}` };
+      else merged.push({ type: "text", text: jotSavedLine(text) });
+      return;
+    }
     const prev = merged[merged.length - 1];
-    if (atBoundary && b.type === "text" && !(b.citations && b.citations.length)
-      && prev && prev.type === "text" && !(prev.citations && prev.citations.length)) {
+    if (atBoundary && isPlain(b) && isPlain(prev)) {
       merged[merged.length - 1] = { ...prev, text: `${prev.text.replace(/\s+$/, "")}\n\n${b.text.replace(/^\s+/, "")}` };
     } else {
       merged.push({ ...b });
@@ -969,7 +1047,7 @@ function joinAcrossToolBoundaries(content) {
   return merged;
 }
 
-// 同じ role のメッセージが続いたら1つにまとめる（tool_use の継続を上限で打ち切った発言の tool_result の後ろに、次の自分の発言が続く場合など）
+// 同じ role のメッセージが続いたら1つにまとめる（空の assistant 発言を落として user が続いた場合など）
 function mergeSameRoleMessages(messages) {
   const toBlocks = (c) => (typeof c === "string" ? [{ type: "text", text: c }] : c);
   const out = [];
@@ -1072,34 +1150,24 @@ function buildThreadText(building, room, thread) {
   return parts.join("\n\n") + "\n";
 }
 
-// テキストログ用のモデル発言本文。書き付けた箇所（jot_note の tool_use）に「（手控え：〈内容〉）」を1行入れる。
+// テキストログ用のモデル発言本文。書き付けた箇所に「（手控え：〈内容〉）」を1行入れる。
+// 古い履歴の jot_note の tool_use は、送信・表示と同じ規則（flattenToolTurns）で「（手控えに書き付けた：…）」にしてから置き換える。
 // 位置の分からない書き付け（構造で保存する前の発言・テキスト化された呼び出しから回収したもの）は末尾に入れる
 function assistantLogBody(m) {
   const jotLine = (t) => `（手控え：${t}）`;
   const leftover = Array.isArray(m.jotted) ? [...m.jotted] : [];
   const takeLeftover = (t) => { const i = leftover.indexOf(t); if (i !== -1) leftover.splice(i, 1); };
-  const lines = [];
-  if (Array.isArray(m.content)) {
-    const results = {};
-    m.content.forEach((b) => { if (b.type === "tool_result") results[b.tool_use_id] = b; });
-    let buf = [];
-    const flush = () => { const t = buf.join("\n").trim(); if (t) lines.push(t); buf = []; };
-    m.content.forEach((b) => {
-      if (b.type === "text") { buf.push(b.text); return; }
-      if (b.type !== "tool_use" || b.name !== JOT_TOOL.name) return;
-      const r = results[b.id];
-      const text = normalizeJotText(b.input && b.input.text);
-      if (!r || r.is_error || !text) return; // 保存できなかった書き付けは載せない
-      flush();
-      lines.push(jotLine(text));
-      takeLeftover(text);
-    });
-    flush();
-  } else {
-    lines.push(extractPlainText(m.content));
-  }
-  leftover.forEach((t) => lines.push(jotLine(t)));
-  return lines.join("\n");
+  const plain = extractPlainText(flattenToolTurns(m.content, true));
+  const lines = plain.split("\n").map((line) => {
+    const parsed = parseJotLine(line);
+    if (parsed === null) return line;
+    const text = normalizeJotText(parsed.raw);
+    if (!text) return null;
+    takeLeftover(text);
+    return jotLine(text);
+  }).filter((line) => line !== null);
+  const body = lines.join("\n").trim();
+  return [body, ...leftover.map(jotLine)].filter((t) => t !== "").join("\n");
 }
 
 // ConfirmDialog は message を HTML として描くので、利用者の文章を差し込むときはエスケープする
@@ -1558,11 +1626,12 @@ async function callModel({ building, apiKey, body, onDelta, onThinkingDelta }) {
 }
 
 // クライアントツールを1つ実行し、tool_result ブロックを返す。jot_note の本文は jotted に積む。
+// （手控えは本文マーカー方式になり、tools に jot_note を送らないので通常は呼ばれない。保険として残す）
 function runClientTool(block, jotted) {
   const result = (content, isError) => (isError
     ? { type: "tool_result", tool_use_id: block.id, content, is_error: true }
     : { type: "tool_result", tool_use_id: block.id, content });
-  if (block.name !== JOT_TOOL.name) return result(`${block.name} というツールはこの部屋にない。`, true);
+  if (block.name !== JOT_TOOL_NAME) return result(`${block.name} というツールはこの部屋にない。`, true);
   if (BROKEN_TOOL_INPUTS.has(block)) return result("入力のJSONを読めなかったため、保存できなかった。", true);
   const text = normalizeJotText(block.input && block.input.text);
   if (!text) return result("書き付ける内容（text）が空だったため、保存できなかった。", true);
@@ -1583,14 +1652,7 @@ function runClientTool(block, jotted) {
 // onThinkingDelta（任意）は各周回の thinking_delta をそのまま渡す（出力中の表示用）。
 // thinking は全周の thinking ブロックの本文を出現順に空行で連結したもの（無ければ ""。表示・ログ専用で、API には送り返さない）。
 // 途中でエラーになった場合は、それまでに usage が返ってきた周の数を error.roundsDone に載せる（未対応パラメータの送り直しの判定用）。
-// deferJotResult（任意。通常送信・編集＆再送信だけが true を渡す）：手控えの「後払い」。tool_use で止まった周が
-//   ・tool_use がすべて jot_note で、返した tool_result がすべて成功（is_error なし）
-//   ・この送信でここまでに積んだ content に見える本文がある（返事を書き終えたあとの書き付け）
-//   のすべてを満たすなら、続きのリクエストを送らずにループを抜け、deferred: true を返す。
-//   tool_result は content の末尾に残り、次の送信で expandToolTurns / mergeSameRoleMessages により
-//   user [tool_result, text(次の発言)] の形で返る。truncated は false のまま。stop_reason は API の "tool_use" のまま返す
-//   （表示側は保存した jotDeferred で「tool_use ─」を出さない）。
-async function callModelWithContinuation({ building, apiKey, body, onDelta, onThinkingDelta, onRound, deferJotResult }) {
+async function callModelWithContinuation({ building, apiKey, body, onDelta, onThinkingDelta, onRound }) {
   const content = [];
   const rounds = [];
   const jotted = [];
@@ -1598,7 +1660,6 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
   let totalUsage = null;
   let toolRounds = 0;
   let truncated = false;
-  let deferred = false;
   let wroteText = false;
   let needSep = false;
   const delta = typeof onDelta === "function"
@@ -1638,26 +1699,11 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
         const toolResults = uses.map((b) => runClientTool(b, jotted));
         // 履歴に構造のまま残すため、返した tool_result も並び順どおり content に差し込む（打ち切る場合も、書き付けは実行済みなので残す）
         content.push(...toolResults);
-        if (deferJotResult
-          && uses.every((b) => b.name === JOT_TOOL.name)
-          && toolResults.every((r) => !r.is_error)
-          && hasVisibleText(content)) {
-          console.log("[書斎] 手控えを後払いにして、このターンを終える（tool_result は次の送信で返す）");
-          deferred = true;
-          break;
-        }
         toolRounds++;
         if (toolRounds > TOOL_LOOP_MAX) {
           console.warn(`[書斎] tool_use の継続が上限（${TOOL_LOOP_MAX}回）に達したため打ち切り`);
           truncated = true;
           break;
-        }
-        // 続きを送るのに、この送信でまだ見える本文が無ければ、成功した jot_note の tool_result で本文を促す
-        // （toolResults は content に積んだものと同じオブジェクトなので、保存される履歴の文言も揃う）
-        if (!hasVisibleText(content)) {
-          toolResults.forEach((r, i) => {
-            if (!r.is_error && uses[i].name === JOT_TOOL.name) r.content = JOT_SAVED_NEED_REPLY_TEXT;
-          });
         }
         followUp = [
           { role: "assistant", content: resendContent },
@@ -1681,7 +1727,7 @@ async function callModelWithContinuation({ building, apiKey, body, onDelta, onTh
     throw e;
   }
   return {
-    content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, deferred, rounds, model: json.model || body.model,
+    content, usage: totalUsage || json.usage, stop_reason: json.stop_reason, jotted, truncated, rounds, model: json.model || body.model,
     thinking: joinThinkingText(content),
   };
 }
@@ -1734,42 +1780,18 @@ function fallbackNoticeText(kind, body) {
   return `この部屋のモデル（${model}）は考える深さ（effort${effort ? `: ${effort}` : ""}）の指定に対応していないため、外して送った`;
 }
 
-// 後払い明けの送信（tool_result で終わる assistant 発言のあと）の400が、ツールブロックの受け渡しによるものらしいか。
-// メッセージがブロック（tool_use / tool_result / thinking ブロック）に触れているときだけ true。判別できなければ false
-function looksLikeToolBoundaryError(e) {
-  return /tool_use|tool_result|thinking[`'"]?\s+blocks?|redacted_thinking/i.test(apiErrorMessage(e));
-}
-
-const DEFERRED_RETRY_NOTICE = "手控えの受け渡しがうまくいかなかったため、直前の発言の書き付けのやりとりを外して送り直した（手控えそのものは残っている）";
-
 // callModelWithContinuation を呼び、未対応の指定で 400 になったら外して送り直す。
-// 返り値は { json, body, notices, toolsDropped }。body は最終的に送ったボディ（綴じ・編みの自動再試行で使い回す）、notices は知らせる文の配列
-// args.dropDeferredTools（任意。後払い明けの送信だけが渡す）：body を受け取り、後払いで終わった assistant 発言の
-//   tool_use / tool_result だけを落とした body を返す関数。400 で落ちたら1回だけこれで送り直す（安全弁）。
-//   どちらの400か判別できないときは、未対応パラメータの送り直しを先に試す。
-//   エラー文がツールブロックに触れているとき（looksLikeToolBoundaryError）だけ、ツールブロックを落とす方を先に試す。
-//   送り直しが通ったら toolsDropped: true を返す（呼び出し側で保存データからも落とす）
+// 返り値は { json, body, notices }。body は最終的に送ったボディ（綴じ・編みの自動再試行で使い回す）、notices は知らせる文の配列
 async function callModelWithParamFallback(args) {
   let body = args.body;
   const done = new Set();
   const notices = [];
-  let toolsDropped = false;
-  const { dropDeferredTools, ...callArgs } = args;
-  const canDropTools = (e) => typeof dropDeferredTools === "function" && !toolsDropped
-    && e && e.status === 400 && !e.roundsDone;
   for (;;) {
     try {
-      const json = await callModelWithContinuation({ ...callArgs, body });
-      return { json, body, notices, toolsDropped };
+      const json = await callModelWithContinuation({ ...args, body });
+      return { json, body, notices };
     } catch (e) {
-      let kind = canDropTools(e) && looksLikeToolBoundaryError(e) ? null : unsupportedParamOf(e, body, done);
-      if (!kind && canDropTools(e)) {
-        console.warn("[書斎] 後払い明けの送信が400になったため、直前の発言の tool_use / tool_result を落として送り直す", e.raw);
-        toolsDropped = true;
-        notices.push(DEFERRED_RETRY_NOTICE);
-        body = dropDeferredTools(body);
-        continue;
-      }
+      const kind = unsupportedParamOf(e, body, done);
       if (!kind) throw e;
       console.warn(`[書斎] このモデルは ${kind} の指定に対応していないため、外して（下げて）送り直す`, e.raw);
       done.add(kind);
@@ -1802,7 +1824,8 @@ async function callModelRetryOnEmpty(args, onJotted) {
     if (json.jotted.length > 0 && onJotted) onJotted(json.jotted);
     allRounds.push(...(json.rounds || []));
     json = { ...json, allRounds, retries: attempt - 1, fallbackNotices };
-    if (hasVisibleText(finalizeAssistantContent(json.content).content)) return json;
+    // 【書き付け】行・保存済みの表記だけの出力は空とみなす（綴じ・編みではその行を取り除くため）
+    if (hasVisibleReply(finalizeAssistantContent(json.content).content)) return json;
     console.warn(`[書斎] 空応答（${attempt}回目）stop_reason`, json.stop_reason, json.usage);
   }
   return json;
@@ -1837,22 +1860,23 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
     system.push(noCache ? { type: "text", text: block2Text } : { type: "text", text: block2Text, cache_control: cc });
   }
   // tools の構成は部屋設定だけで決まる（通常送信・綴じ・編むで一致させ、キャッシュのプレフィックスを揃える）
+  // 手控えは本文マーカー方式（block2 の案内文）なので、jot_note は手控えONの部屋でも送らない
   const toolList = [];
   if (room.webSearch) toolList.push({ type: "web_search_20250305", name: "web_search", max_uses: WEB_SEARCH_MAX_USES });
-  if (room.jotNote) toolList.push(JOT_TOOL);
   const tools = toolList.length > 0 ? toolList : undefined;
   // 履歴の thinking / redacted_thinking は送らない（この改修より前に保存された発言にも残っているため、送信時にも落とす）
   // 履歴に残ったテキスト化された jot_note 呼び出しも送らない（モデルが真似をして、本物のツール呼び出しをしなくなるため）
+  // 道具方式の頃の古い履歴に残った tool_use / tool_result は text に変換する（flattenToolTurns。保存データは変えない）。
+  //   手控えONの部屋では jot_note の tool_use を「（手控えに書き付けた：…）」の1行に、OFFの部屋では何も残さない
   // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
   const sendable = messagesToSend
     .map((m) => {
       if (m.role !== "assistant") return m;
       const content = Array.isArray(m.content) ? stripThinkingBlocks(m.content) : m.content;
-      return { ...m, content: stripTextualJotCalls(content).content };
+      return { ...m, content: flattenToolTurns(stripTextualJotCalls(content).content, !!room.jotNote) };
     })
     .filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
-  // 保存した tool_use / tool_result を API の形に展開する。jot_note を tools に送らない部屋では除去して前後の本文を結合する
-  const expanded = mergeSameRoleMessages(sendable.flatMap((m) => (m.role === "assistant" ? expandToolTurns(m, !!room.jotNote) : [m])));
+  const expanded = mergeSameRoleMessages(sendable);
   const payloadMessages = expanded.map((m, i) => {
     if (i !== expanded.length - 1 || noCache) {
       return { role: m.role, content: m.content };
@@ -1868,8 +1892,7 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
     }
     return { role: m.role, content };
   });
-  // 履歴が tool_result（手控えの後払い待ち）で終わっていると、足した指示文（user）と role が続くので1つにまとめる
-  // （user [tool_result, 指示文]）。extraMessages にはキャッシュ境界を付けない
+  // 履歴が user で終わっていると、足した指示文（user）と role が続くので1つにまとめる。extraMessages にはキャッシュ境界を付けない
   const allMessages = options.extraMessages ? mergeSameRoleMessages([...payloadMessages, ...options.extraMessages]) : payloadMessages;
 
   const body = {
@@ -1916,6 +1939,8 @@ function buildBlock2(room, memories, retrospects, notes, frozenDate) {
         ? "直近の記録はまだない。"
         : "まだ記録はない。今日が最初の日ということ。";
   const retrospectText = retrospect ? `【回想録 ─ 遠い記憶】\n${extractTextualJotCalls(retrospect.text).text}\n\n` : "";
+  // 手控えONの部屋だけ、書き付け方の案内（固定文。手控えが0件でも出す）を手控えの位置に入れる
+  const guideText = room.jotNote ? `${JOT_GUIDE_TEXT}\n\n` : "";
   // 手控え（会話中にモデル本人が書き付けたもの）。回想録には編まれず、消されるまで残る。0件ならセクションごと出さない。
   const roomNotes = (notes || [])
     .filter((n) => n.roomId === room.id)
@@ -1923,7 +1948,7 @@ function buildBlock2(room, memories, retrospects, notes, frozenDate) {
   const notesText = roomNotes.length > 0
     ? `【手控え ─ 会話の途中で自分が書き付けたこと】\n${roomNotes.map((n) => `・${formatYMD(n.createdAt)}：${n.text}`).join("\n")}\n\n`
     : "";
-  return `${retrospectText}${notesText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
+  return `${retrospectText}${guideText}${notesText}【記録帳】\n${memoryText}\n\n【この部屋の日付】\n${frozenDate}（スレッド作成日で凍結。「今日の日付」として扱ってよいが、厳密な現在時刻は不明であることを知っておくこと）`;
 }
 
 /* ----- block2 の据え置き -----
@@ -1932,7 +1957,7 @@ function buildBlock2(room, memories, retrospects, notes, frozenDate) {
    次のときだけ作り直す。それ以外（ツールループの途中・キャッシュが生きている間の通常送信・綴じ）は控えをそのまま送る。
    ・新しいスレッド（控えが無い）
    ・前回のリクエストから部屋の TTL 以上経った（どうせキャッシュは切れている）
-   ・綴じ・編みのあと／記録帳で記録・手控えを編集・追加・削除したとき（invalidateBlock2 で控えを捨てる）
+   ・綴じ・編みのあと／記録帳で記録・手控えを編集・追加・削除したとき／部屋設定で手控えのON/OFFを切り替えたとき（invalidateBlock2 で控えを捨てる）
    書き付けた手控えは保存・表示は即時、block2 への反映だけが上の時機まで遅れる。 */
 function cacheTtlMs(room) {
   return room.cacheTtl === "1h" ? 60 * 60 * 1000 : 5 * 60 * 1000;
@@ -2472,14 +2497,18 @@ function MarkdownText({ text }) {
 }
 
 // markdown: true はモデルの発言だけ。自分の発言はプレーンテキストのまま
-function MessageContent({ content, markdown = false }) {
-  const body = (text) => (markdown ? <MarkdownText text={text} /> : <div>{text}</div>);
+// モデルの発言では、書き付けの行（【書き付け】行・「（手控えに書き付けた：…）」の行）を出さない（書き付けの表示は JottedLine が担う）
+// hideJotMarkers が false（手控えOFFの部屋）なら【書き付け】行は本文として出す（保存済みの表記の行だけ隠す）
+function MessageContent({ content, markdown = false, hideJotMarkers = true }) {
+  const shown = (text) => (markdown ? hideJotLines(text, hideJotMarkers) : text);
+  const body = (text) => (markdown ? <MarkdownText text={shown(text)} /> : <div>{text}</div>);
   if (typeof content === "string") {
     return body(content);
   }
   if (!Array.isArray(content)) return null;
-  // tool_use / tool_result は表示しない。ツールを挟んで分かれた前後の本文は空行1つでつなぐ（ストリーミング中の見た目と同じ）
-  const textBlocks = joinAcrossToolBoundaries(content).filter((b) => b.type === "text");
+  // 古い履歴の tool_use / tool_result は送信と同じ規則（flattenToolTurns）で text に変換する。
+  // ツールを挟んで分かれた前後の本文は空行1つでつながる（書き付けの行は上で隠す）
+  const textBlocks = flattenToolTurns(content, true).filter((b) => b.type === "text");
   const text = textBlocks.map((b) => b.text).join("");
   const citations = textBlocks.flatMap((b) => b.citations || []);
   return (
@@ -2718,7 +2747,8 @@ function ConversationScreen({
     if (streamRafRef.current !== null) return;
     streamRafRef.current = requestAnimationFrame(() => {
       streamRafRef.current = null;
-      setStreamText(streamBufRef.current);
+      // 【書き付け】の行（書きかけを含む）は画面に出さない
+      setStreamText(room.jotNote ? hideJotMarkersWhileStreaming(streamBufRef.current) : streamBufRef.current);
       setStreamThinking(thinkingBufRef.current);
     });
   }
@@ -2791,7 +2821,6 @@ function ConversationScreen({
   }
 
   async function runSend(nextMessages) {
-    // nextMessages は安全弁（後払い明けの400）でツールブロックを落とした形に差し替えることがある
     setError(null);
     setBundleNotice(null);
     setSendNotice(null);
@@ -2805,45 +2834,26 @@ function ConversationScreen({
     let saved = false;
 
     try {
-      // block2 は据え置き（resolveBlock2）。ツールループの各周は同じ body を使うので、ターン内でも変わらない
+      // block2 は据え置き（resolveBlock2）。継続ループの各周は同じ body を使うので、ターン内でも変わらない
       const block2Text = resolveBlock2({ room, thread, memories, retrospects, notes });
       // 部屋ごとの指定：effort（おまかせなら付けない）・出力上限・「思考を見る」部屋だけ thinking
       const ctx = { building, room, memories, retrospects, notes, frozenDate: thread.frozenDate };
       const sendOptions = { block2Text, ...sendOptionsFor(room) };
       const body = buildRequestBody(ctx, nextMessages, sendOptions);
-      // 後払い明けの送信か（履歴の最後の assistant 発言が tool_result で終わっている）。手控えOFFの部屋は送信時にツールブロックを落とすので対象外
-      const deferredIndex = room.jotNote ? pendingToolResultIndex(nextMessages) : -1;
       let json;
       try {
         // 未対応の指定（effort・thinking・出力上限）で 400 になったら、その指定だけ外して1回送り直し、知らせる
-        // 後払い明けの送信が 400 になったら、その発言のツールブロックだけ落として1回送り直す（dropDeferredTools）
         const r = await callModelWithParamFallback({
           building, apiKey, body, onDelta: appendStream, onThinkingDelta: appendThinking, onRound: (r) => spentRounds.push(r),
-          deferJotResult: true,
-          dropDeferredTools: deferredIndex === -1 ? undefined
-            : (cur) => ({ ...cur, messages: buildRequestBody(ctx, dropToolBlocksAt(nextMessages, deferredIndex), sendOptions).messages }),
         });
         json = r.json;
         if (r.notices.length > 0) setSendNotice(r.notices.join("\n"));
-        if (r.toolsDropped) {
-          // 次回以降に同じ400を踏まないよう、保存してあるその発言からもツールブロックを落とす（手控えそのものは保存済みなので触れない）
-          nextMessages = dropToolBlocksAt(nextMessages, deferredIndex);
-          onUpdateThread({ ...thread, messages: nextMessages });
-        }
-        if (deferredIndex !== -1) {
-          // 未確認事項の判定用：後払い明けのターンで thinking が返ってきたか（履歴の thinking は送っていない）
-          const hasThinking = (json.content || []).some((b) => b.type === "thinking" || b.type === "redacted_thinking");
-          console.log("[書斎] 後払い明けのターン：thinking ブロック", hasThinking ? "あり" : "なし", r.toolsDropped ? "（ツールブロックを落として送り直した）" : "");
-        }
       } catch (e) {
-        // 途中で失敗しても、それまでに書き付けられた手控えは残す
+        // 途中で失敗しても、それまでに書き付けられた手控えは残す（道具方式の保険）
         if (e.jotted) onAddNotes(e.jotted);
         throw e;
       }
       // 保存する形に整える（finalizeAssistantContent）。
-      // ・クライアントツールの tool_use と、ループ中に返した tool_result は構造のまま残す。手控え欄は据え置きなので、
-      //   モデルが次のターンで「自分が書き付けたこと」を確かめられる証拠はこれだけになる。
-      //   手控えをOFFにした部屋では、送信時（buildRequestBody）に除去して前後の本文を結合する（tools 未定義エラーを避ける）。
       // 保存しないブロック：
       // ・thinking / redacted_thinking（前段の system・tools・履歴と紐づけて検証される。栞は block2 が綴じや書き付けで
       //   変わるため、残して再送すると不定期に400になる。記憶は記録帳・回想録・手控えが担う）
@@ -2851,14 +2861,19 @@ function ConversationScreen({
       // 継続ループ内（同一ターン）では無加工のまま積み直しているので、ここで落とすのは最終保存時のみ。
       // server_tool_use / web_search_tool_result は assistant content 内で完結するのでそのまま残す。
       const finalized = finalizeAssistantContent(json.content);
-      const jotted = [...json.jotted, ...(room.jotNote ? finalized.jotted : [])];
       if (finalized.removed > 0) console.warn("[書斎] テキスト化された jot_note 呼び出しを回収", finalized.jotted);
+      // 【書き付け】行の抜き取り（手控えONの部屋だけ。OFFの部屋では本文はそのまま）。
+      // 保存する本文では、その行を「（手控えに書き付けた：内容）」に置き換える（保存時に1回だけ。あとから書き換えない）
+      const marked = room.jotNote ? extractJotMarkersFromContent(finalized.content, "replace") : { content: finalized.content, jotted: [], found: 0 };
+      if (marked.found > 0) console.log("[書斎] 【書き付け】行を抜き取った", marked.jotted);
+      const jotted = [...new Set([...json.jotted, ...(room.jotNote ? finalized.jotted : []), ...marked.jotted])];
 
-      // 手控えは応答の成否（空応答・refusal を含む）に関わらず保存する
+      // 手控えは応答の成否（空応答・refusal を含む）に関わらず保存する。同じ本文の手控えが既にあれば保存しない（addNotes が弾く）
       if (jotted.length > 0) onAddNotes(jotted);
 
       // 空応答は保存しない。送ったユーザー発言は残すので、編集＆再送信でやり直せる。
-      if (!hasVisibleText(finalized.content)) {
+      // 書き付けの行だけで、見える本文が無いものも空応答として扱う
+      if (!hasVisibleReply(marked.content, !!room.jotNote)) {
         console.warn("[書斎] 空応答 stop_reason", json.stop_reason, json.usage);
         const message = json.stop_reason === "refusal"
           ? "この話題には筆を執れなかったようだ。言い回しを変えて、もう一度試してみてほしい。"
@@ -2870,11 +2885,9 @@ function ConversationScreen({
 
       // ts は応答が最終的に完了した時刻（継続ループ後）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）
       const assistantMessage = {
-        role: "assistant", content: finalized.content,
+        role: "assistant", content: marked.content,
         ts: nowISO(), usage: json.usage, stopReason: json.stop_reason,
       };
-      // 手控えを後払いにして終えた発言（stop_reason は "tool_use" のままだが正常終了。usage 行に「tool_use ─」を出さない）
-      if (json.deferred) assistantMessage.jotDeferred = true;
       // 金額の計算用：その発言を返したモデルと、複数回リクエストしたターンの各回の usage（表示専用。API には送らない）
       if (json.model) assistantMessage.model = json.model;
       if (json.rounds && json.rounds.length > 1) assistantMessage.rounds = json.rounds;
@@ -3039,7 +3052,7 @@ function ConversationScreen({
             ) : m.role === "user" ? (
               <div className="bubble-user"><MessageContent content={m.content} /></div>
             ) : (
-              <MessageContent content={m.content} markdown />
+              <MessageContent content={m.content} markdown hideJotMarkers={!!room.jotNote} />
             )}
             {timed && !(m.role === "user" && editingIndex === i) && <div className="msg-time">{formatTimeHM(m.ts)}</div>}
             {m.role === "user" && editingIndex !== i && (
@@ -3789,10 +3802,19 @@ function App() {
     downloadFile(name, JSON.stringify(data, null, 2), "application/json");
   }
   // 手控えの追記。送信は非同期で終わるため、レンダー時点の notes ではなくメモリ上の最新（latestRef）に足す。
+  // その部屋に同じ本文の手控えが既にあれば保存しない（送り直しで同じ手控えが重複するのを防ぐ）
   function addNotes(roomId, texts) {
     const ts = nowISO();
-    const added = texts.map((text) => ({ id: uid(), roomId, text, createdAt: ts }));
-    setNotes([...latestRef.current.notes, ...added]);
+    const cur = latestRef.current.notes;
+    const known = new Set(cur.filter((n) => n.roomId === roomId).map((n) => n.text));
+    const added = [];
+    texts.forEach((text) => {
+      if (!text || known.has(text)) return;
+      known.add(text);
+      added.push({ id: uid(), roomId, text, createdAt: ts });
+    });
+    if (added.length === 0) return;
+    setNotes([...cur, ...added]);
   }
 
   // 画面上部の帯（保存の失敗）。どの画面でも、その画面の上に出す
@@ -3948,7 +3970,10 @@ function App() {
           // 綴じと同じく、テキスト化された呼び出しは取り除き、中身は手控えとして回収する
           const finalized = finalizeAssistantContent(json.content);
           if (room.jotNote && finalized.jotted.length > 0) addNotes(room.id, finalized.jotted);
-          const text = extractPlainText(finalized.content).trim();
+          // 【書き付け】行・「（手控えに書き付けた：…）」の行は回想録に入れない。手控えONの部屋なら中身は手控えとして保存する
+          const marked = extractJotMarkersFromContent(finalized.content, "remove");
+          if (room.jotNote && marked.jotted.length > 0) addNotes(room.id, marked.jotted);
+          const text = extractPlainText(marked.content).trim();
           if (!text) {
             console.warn("[書斎] 編み空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("回想録が編めなかった。もう一度試してみてほしい。", {
@@ -4022,7 +4047,11 @@ function App() {
           // 必ず取り除き、中身は手控えとして回収する
           const finalized = finalizeAssistantContent(json.content);
           if (room.jotNote && finalized.jotted.length > 0) addNotes(room.id, finalized.jotted);
-          const text = extractPlainText(finalized.content).trim();
+          // block2 の案内文を読んで、記録の中に【書き付け】行を書くことがある。記録帳には入れず、手控えONの部屋なら中身は手控えとして保存する
+          // （履歴の「（手控えに書き付けた：…）」を真似た行も記録帳には入れない）
+          const marked = extractJotMarkersFromContent(finalized.content, "remove");
+          if (room.jotNote && marked.jotted.length > 0) addNotes(room.id, marked.jotted);
+          const text = extractPlainText(marked.content).trim();
           if (!text) {
             console.warn("[書斎] 綴じ空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("記録が綴られなかった。もう一度試してみてほしい。", {
@@ -4086,6 +4115,9 @@ function App() {
           setRooms([...rooms, newRoom]);
         }}
         onEditRoom={(roomId, data) => {
+          // 手控えのON/OFFを切り替えたら、その部屋の block2（書き付け方の案内の有無）を次の送信で作り直す
+          const before = rooms.find((r) => r.id === roomId);
+          if (before && !!before.jotNote !== !!data.jotNote) invalidateBlock2(roomId);
           setRooms(rooms.map((r) => {
             if (r.id !== roomId) return r;
             // おまかせ（effort を持たない）に戻したら、キーごと外す
