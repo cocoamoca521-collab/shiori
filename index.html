@@ -368,6 +368,7 @@
   .center-screen form { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 12px; }
 
   .settings-block { margin-bottom: 28px; }
+  .app-build { text-align: center; font-size: 11px; color: var(--muted); margin: 8px 0 24px; }
   .settings-block h2 { font-size: 14px; color: var(--muted); font-weight: 500; margin-bottom: 10px; }
   .kv-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
 
@@ -414,6 +415,10 @@ const K = {
   prices: "shosai_prices",
 };
 
+// アプリの版（実機でどの版が動いているかの確認用。設定画面の一番下に小さく出す）。
+// index.html を変えたら、その日の日付と通し番号に書き換えること（例：2026-11-23.1 → 同じ日の次の変更は .2）
+const APP_BUILD = "2026-11-23.1";
+
 const WEB_SEARCH_MAX_USES = 3;
 // 通常送信・編集＆再送信の出力上限。思考トークンもこの上限に含まれるので、本文が途中で切れないよう大きめに取る
 // （課金は実際に使った分だけ）。effort が xhigh / max の部屋は思考が長くなるのでさらに広げる
@@ -439,8 +444,13 @@ const JOT_NOTE_MAX_CHARS = 120;
 const JOT_TOOL_NAME = "jot_note";
 const JOT_SAVED_TEXT = "保存しました";
 const JOT_MARKER = "【書き付け】";
-// 保存した発言の本文で、マーカー行を置き換える形（保存時に1回だけ。あとから書き換えない）
+// 送信用の履歴で、書き付けた発言の本文の末尾に足す注記の形。
+// 保存する本文には入れない（書き付けの中身は発言の jotLines に持ち、送るときに毎回同じ形で足す。appendJotLines）
 const jotSavedLine = (text) => `（手控えに書き付けた：${text}）`;
+// 注記の判定に使う語。半角カッコ・行の途中に書かれたもの（モデルが履歴を真似たもの）も注記として扱う
+const JOT_SAVED_WORD = "手控えに書き付けた";
+// 本文のどこにあっても注記とみなす形（表示で隠す・掃除で抜き取る）
+const JOT_ANNOTATION_RE = /[（(]手控えに書き付けた[：:]([^）)\n]*)[）)]/g;
 // 手控えONの部屋の block2 に入れる書き付け方の案内。1文字でも変わるとキャッシュが割れるので、動く値を混ぜないこと
 const JOT_GUIDE_TEXT = `【手控えの書き付け方】
 会話の中で「これは残しておきたい」と思った事実・約束・好み・出来事があれば、返事の本文を書き終えたあとに改行して
@@ -916,13 +926,14 @@ function finalizeAssistantContent(content) {
 
 /* ----- 本文マーカー方式の手控え -----
    モデルは返事の本文のあとに「【書き付け】内容」の行を添える。応答の完了時にその行を抜き取って手控えに保存し、
-   保存する本文ではその行を「（手控えに書き付けた：内容）」の1行に置き換える（保存時に1回だけ）。
+   保存する本文からはその行を取り除く。中身は発言の jotLines に持ち、送信用の履歴を組み立てるときだけ
+   本文の末尾に「（手控えに書き付けた：内容）」の行として毎回同じ形で足す（appendJotLines。保存データは変えない）。
    行頭の空白と * _ の装飾、マーカー直後の空白・「:」「：」は読み飛ばす。
-   会話の新しい応答に「（手控えに書き付けた：…）」の行をそのまま書いてしまった場合（履歴の真似）も、書き付けとして受け取る
+   会話の新しい応答に「（手控えに書き付けた：…）」の行をそのまま書いてしまった場合（履歴の真似。半角カッコも）も、書き付けとして受け取る
    （同じ本文の手控えが既にあれば保存されない）。綴じ・編みの出力では、この行は取り除くだけで保存しない
    （記録の中で過去の書き付けを引き写しただけのことが多く、消した手控えを生き返らせないため）。 */
 const JOT_MARKER_LINE_RE = /^[ \t]*([*_]*)【書き付け】(.*)$/;
-const JOT_SAVED_LINE_RE = /^[ \t]*[*_]*（手控えに書き付けた：([\s\S]*)）[*_]*[ \t]*$/;
+const JOT_SAVED_LINE_RE = /^[ \t]*[*_]*[（(]手控えに書き付けた[：:]([\s\S]*)[）)][*_]*[ \t]*$/;
 
 // 書き付けの行なら { raw: 中身（装飾・区切りを除いたもの。空なら ""）, saved: 保存済みの表記か }、違えば null
 function parseJotLine(line) {
@@ -936,11 +947,16 @@ function parseJotLine(line) {
   return s ? { raw: s[1], saved: true } : null;
 }
 
+// 行を抜いたあとの空行・前後の空白を整える
+function tidyAfterRemoval(text) {
+  return text.replace(/[ \t]+(?=\n|$)/g, "").replace(/\n[ \t]*(?=\n)/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 // 文字列から書き付けの行を抜き取る。返り値 { text, jotted, found }。
-// mode "replace"（会話の発言を保存するとき）：行を「（手控えに書き付けた：内容）」に置き換え、中身が空の行は行ごと消す。
+// mode "strip"（会話の発言を保存するとき）：行を消し、中身（保存済みの表記を真似た行も）を出現順に jotted に入れる。
 // mode "remove"（綴じ・編みの出力）：行を消す。保存済みの表記の行は jotted に入れない。
-function extractJotMarkers(text, mode = "replace") {
-  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes("（手控えに書き付けた："))) {
+function extractJotMarkers(text, mode = "strip") {
+  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes(JOT_SAVED_WORD))) {
     return { text, jotted: [], found: 0 };
   }
   const jotted = [];
@@ -952,15 +968,13 @@ function extractJotMarkers(text, mode = "replace") {
     found++;
     const jot = normalizeJotText(parsed.raw);
     if (jot && !(mode === "remove" && parsed.saved)) jotted.push(jot);
-    if (mode === "replace" && jot) lines.push(jotSavedLine(jot));
   });
   if (found === 0) return { text, jotted, found };
-  const out = lines.join("\n").replace(/\n[ \t]*(?=\n)/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-  return { text: out, jotted, found };
+  return { text: tidyAfterRemoval(lines.join("\n")), jotted, found };
 }
 
 // assistant の content（文字列 or ブロック配列）の text から書き付けの行を抜き取る。空になった text ブロックは落とす
-function extractJotMarkersFromContent(content, mode = "replace") {
+function extractJotMarkersFromContent(content, mode = "strip") {
   if (typeof content === "string") {
     const r = extractJotMarkers(content, mode);
     return { content: r.text, jotted: r.jotted, found: r.found };
@@ -980,27 +994,66 @@ function extractJotMarkersFromContent(content, mode = "replace") {
   return { content: found > 0 ? out : content, jotted, found };
 }
 
-// 表示用：書き付けの行（マーカー行・保存済みの表記）を隠した文字列。
-// markers が false（手控えOFFの部屋。抜き取らなかった【書き付け】行は本文のまま）なら、保存済みの表記の行だけを隠す
-function hideJotLines(text, markers = true) {
-  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes("（手控えに書き付けた："))) return text;
-  return text.split("\n").filter((line) => {
-    const parsed = parseJotLine(line);
-    return parsed === null || (!markers && !parsed.saved);
-  }).join("\n").replace(/\s+$/, "");
+// 文字列から注記（「（手控えに書き付けた：…）」。行の途中・半角カッコも）を抜き取る。返り値 { text, lines, found }。
+// lines は抜き取った中身（空のものは除く）。注記だけの行は行ごと消える
+function extractJotAnnotations(text) {
+  if (typeof text !== "string" || !text.includes(JOT_SAVED_WORD)) return { text, lines: [], found: 0 };
+  const lines = [];
+  let found = 0;
+  const out = text.replace(JOT_ANNOTATION_RE, (_, inner) => {
+    found++;
+    const jot = normalizeJotText(inner);
+    if (jot) lines.push(jot);
+    return "";
+  });
+  if (found === 0) return { text, lines, found };
+  // 注記を抜いて装飾だけが残った行（**  ** など）も消す
+  const cleaned = out.split("\n").filter((l) => !/^[ \t]*[*_]+[ \t]*$/.test(l)).join("\n");
+  return { text: tidyAfterRemoval(cleaned), lines, found };
 }
 
-// ストリーミング中の表示用：書き付けの行を隠す。書きかけの最後の行が、マーカー（装飾つきも）の書き出しに見えるうちも隠す
+// 送信用：保存した発言の jotLines を、本文の末尾に「（手控えに書き付けた：…）」の行として足す。
+// 入力は変えずに新しい content を返す。同じ発言からは何回組み立てても同じ結果になる（キャッシュのため）
+function appendJotLines(content, jotLines) {
+  if (!Array.isArray(jotLines) || jotLines.length === 0) return content;
+  const tail = jotLines.map(jotSavedLine).join("\n");
+  if (typeof content === "string") return content === "" ? tail : `${content}\n${tail}`;
+  if (!Array.isArray(content)) return content;
+  let last = -1;
+  content.forEach((b, i) => { if (b.type === "text") last = i; });
+  if (last === -1) return [...content, { type: "text", text: tail }];
+  return content.map((b, i) => {
+    if (i !== last) return b;
+    // 引用付きのブロックに足すと引用の範囲が変わるので、その後ろに別ブロックで足す
+    if (b.citations && b.citations.length) return b;
+    return { ...b, text: `${b.text}\n${tail}` };
+  }).concat(content[last].citations && content[last].citations.length ? [{ type: "text", text: tail }] : []);
+}
+
+// 表示用：書き付けの行（マーカー行・保存済みの表記）と、行の途中の注記を隠した文字列。
+// markers が false（手控えOFFの部屋。抜き取らなかった【書き付け】行は本文のまま）なら、注記だけを隠す
+function hideJotLines(text, markers = true) {
+  if (typeof text !== "string" || (!text.includes(JOT_MARKER) && !text.includes(JOT_SAVED_WORD))) return text;
+  const kept = text.split("\n").filter((line) => {
+    const parsed = parseJotLine(line);
+    return parsed === null || (!markers && !parsed.saved);
+  }).join("\n");
+  return extractJotAnnotations(kept).text.replace(/\s+$/, "");
+}
+
+// ストリーミング中の表示用：書き付けの行を隠す。書きかけの最後の行が、マーカー（装飾つきも）・注記の書き出しに見えるうちも隠す
 function hideJotMarkersWhileStreaming(text) {
   if (typeof text !== "string" || text === "") return text;
   const lines = text.split("\n");
   const last = lines.pop();
   const head = hideJotLines(lines.join("\n"));
   const lead = last.replace(/^[ \t]*[*_]*/, "");
-  const partial = lead !== "" && (JOT_MARKER.startsWith(lead) || "（手控えに書き付けた：".startsWith(lead)
-    || parseJotLine(last) !== null || lead.startsWith("（手控えに書き付けた："));
+  const savedHeads = ["（手控えに書き付けた：", "(手控えに書き付けた：", "（手控えに書き付けた:", "(手控えに書き付けた:"];
+  const partial = lead !== "" && (JOT_MARKER.startsWith(lead)
+    || savedHeads.some((h) => h.startsWith(lead) || lead.startsWith(h)) || parseJotLine(last) !== null);
   if (partial) return head;
-  return lines.length > 0 ? `${head}\n${last}` : last;
+  const shownLast = hideJotLines(last);
+  return lines.length > 0 ? `${head}\n${shownLast}` : shownLast;
 }
 
 // 書き付けの行を除いて、見える本文があるか（無ければ「返事の本文が空」）
@@ -1059,7 +1112,39 @@ function mergeSameRoleMessages(messages) {
   return out;
 }
 
+// assistant 発言の本文（text ブロック）から注記を抜き取り、中身を jotLines の後ろに移した発言を返す。
+// 注記が無ければ同じ発言をそのまま返す（changed: false）。手控え帖・jotted（「✎ 書き付けた」の表示）には触れない
+function moveJotAnnotationsToLines(m) {
+  const lines = [];
+  let found = 0;
+  let content = m.content;
+  if (typeof content === "string") {
+    const r = extractJotAnnotations(content);
+    found = r.found;
+    lines.push(...r.lines);
+    content = r.text;
+  } else if (Array.isArray(content)) {
+    const out = [];
+    content.forEach((b) => {
+      if (b.type !== "text") { out.push(b); return; }
+      const r = extractJotAnnotations(b.text);
+      if (r.found === 0) { out.push(b); return; }
+      found += r.found;
+      lines.push(...r.lines);
+      if (r.text !== "") out.push({ ...b, text: r.text });
+    });
+    content = out;
+  }
+  if (found === 0) return { message: m, changed: false, found: 0 };
+  const message = { ...m, content };
+  const jotLines = [...(Array.isArray(m.jotLines) ? m.jotLines : []), ...lines];
+  if (jotLines.length > 0) message.jotLines = jotLines;
+  return { message, changed: true, found };
+}
+
 // 一度きりの掃除：全部屋の履歴・記録帳・回想録からテキスト化された呼び出しを除去し、中身を手控えとして救出する計画を立てる。
+// あわせて、会話の発言の本文に入っている注記（「（手控えに書き付けた：…）」）を本文から抜き、jotLines に移す
+// （送信時は appendJotLines で末尾に注記の行として足すので、モデルから見た履歴は保たれる。手控えそのものは消さない）。
 // data は { rooms, threads, memories, retrospects, notes }。データは書き換えず、適用後の値と集計を返す。
 function planTextualJotCleanup({ rooms, threads, memories, retrospects, notes }) {
   const roomName = (id) => (rooms.find((r) => r.id === id) || {}).name || "（不明な部屋）";
@@ -1068,7 +1153,7 @@ function planTextualJotCleanup({ rooms, threads, memories, retrospects, notes })
   notes.forEach((n) => { (known[n.roomId] = known[n.roomId] || new Set()).add(n.text); });
   const rescued = [];
   let skippedDup = 0;
-  const summary = { messages: 0, droppedMessages: 0, memories: 0, retrospects: 0, rescued: 0, skippedDup: 0 };
+  const summary = { messages: 0, droppedMessages: 0, memories: 0, retrospects: 0, rescued: 0, skippedDup: 0, annotations: 0, annotatedMessages: 0 };
 
   function rescue(roomId, texts, createdAt) {
     texts.forEach((text) => {
@@ -1082,8 +1167,16 @@ function planTextualJotCleanup({ rooms, threads, memories, retrospects, notes })
   const nextThreads = threads.map((t) => {
     let changed = false;
     const messages = [];
-    (t.messages || []).forEach((m) => {
-      if (m.role !== "assistant") { messages.push(m); return; }
+    (t.messages || []).forEach((m0) => {
+      if (m0.role !== "assistant") { messages.push(m0); return; }
+      // 本文の注記を jotLines に移す
+      const a = moveJotAnnotationsToLines(m0);
+      const m = a.message;
+      if (a.changed) {
+        changed = true;
+        summary.annotations += a.found;
+        summary.annotatedMessages++;
+      }
       const r = stripTextualJotCalls(m.content);
       if (r.removed === 0) { messages.push(m); return; }
       changed = true;
@@ -1868,12 +1961,15 @@ function buildRequestBody({ building, room, memories, retrospects, notes, frozen
   // 履歴に残ったテキスト化された jot_note 呼び出しも送らない（モデルが真似をして、本物のツール呼び出しをしなくなるため）
   // 道具方式の頃の古い履歴に残った tool_use / tool_result は text に変換する（flattenToolTurns。保存データは変えない）。
   //   手控えONの部屋では jot_note の tool_use を「（手控えに書き付けた：…）」の1行に、OFFの部屋では何も残さない
+  // 本文マーカー方式で書き付けた発言は、手控えONの部屋なら jotLines を「（手控えに書き付けた：…）」の行にして本文の末尾に足す
+  //   （appendJotLines。保存データは変えず、何回組み立てても同じ結果になる）
   // 過去に保存されてしまった空の assistant 発言は送らない（APIに弾かれるため）
   const sendable = messagesToSend
     .map((m) => {
-      if (m.role !== "assistant") return m;
+      if (m.role !== "assistant") return { role: m.role, content: m.content };
       const content = Array.isArray(m.content) ? stripThinkingBlocks(m.content) : m.content;
-      return { ...m, content: flattenToolTurns(stripTextualJotCalls(content).content, !!room.jotNote) };
+      const flat = flattenToolTurns(stripTextualJotCalls(content).content, !!room.jotNote);
+      return { role: m.role, content: room.jotNote ? appendJotLines(flat, m.jotLines) : flat };
     })
     .filter((m) => m.role !== "assistant" || hasVisibleText(m.content));
   const expanded = mergeSameRoleMessages(sendable);
@@ -2863,8 +2959,8 @@ function ConversationScreen({
       const finalized = finalizeAssistantContent(json.content);
       if (finalized.removed > 0) console.warn("[書斎] テキスト化された jot_note 呼び出しを回収", finalized.jotted);
       // 【書き付け】行の抜き取り（手控えONの部屋だけ。OFFの部屋では本文はそのまま）。
-      // 保存する本文では、その行を「（手控えに書き付けた：内容）」に置き換える（保存時に1回だけ。あとから書き換えない）
-      const marked = room.jotNote ? extractJotMarkersFromContent(finalized.content, "replace") : { content: finalized.content, jotted: [], found: 0 };
+      // 保存する本文からはその行を取り除き、中身は jotLines に持つ（送るときだけ appendJotLines で注記の行にして末尾に足す）
+      const marked = room.jotNote ? extractJotMarkersFromContent(finalized.content, "strip") : { content: finalized.content, jotted: [], found: 0 };
       if (marked.found > 0) console.log("[書斎] 【書き付け】行を抜き取った", marked.jotted);
       const jotted = [...new Set([...json.jotted, ...(room.jotNote ? finalized.jotted : []), ...marked.jotted])];
 
@@ -2892,6 +2988,8 @@ function ConversationScreen({
       if (json.model) assistantMessage.model = json.model;
       if (json.rounds && json.rounds.length > 1) assistantMessage.rounds = json.rounds;
       if (jotted.length > 0) assistantMessage.jotted = jotted;
+      // 送信用の注記の中身（本文から抜き取った書き付けの行の順。表示には使わない。API には注記の行として送る）
+      if (marked.jotted.length > 0) assistantMessage.jotLines = marked.jotted;
       // 思考（全周の thinking ブロックの本文）。表示・ログ専用で、API には送らない（buildRequestBody は role と content だけを送る）。
       // content の thinking ブロック自体は上のとおり保存しない
       if (json.thinking) assistantMessage.thinking = json.thinking;
@@ -3518,18 +3616,21 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
       <div className="settings-block">
         <h2>書き付けの掃除</h2>
         <div className="kv-row">
-          <span>会話・記録帳・回想録に文字のまま残った手控えの呼び出しを取り除き、中身を手控えに救出する</span>
+          <span>会話・記録帳・回想録に文字のまま残った手控えの呼び出しを取り除き、中身を手控えに救出する。会話の本文に入った注記「（手控えに書き付けた：…）」も本文から抜く</span>
           <button style={{ flexShrink: 0 }} onClick={() => { setCleanupResult(null); setCleanupError(null); setCleanupScan(onScanJotCleanup()); }}>調べる</button>
         </div>
         {cleanupScan && !cleanupResult && (
           <div className="kv-row" style={{ display: "block" }}>
-            {cleanupScan.total === 0 ? (
-              <div>残っている呼び出しは見つからなかった。</div>
+            {cleanupScan.total === 0 && cleanupScan.annotations === 0 ? (
+              <div>残っている呼び出しも、本文の注記も見つからなかった。</div>
             ) : (
               <>
-                <div>見つかった呼び出し：{cleanupScan.total}件（会話の発言 {cleanupScan.messages}件・記録帳 {cleanupScan.memories}件・回想録 {cleanupScan.retrospects}件）</div>
+                {cleanupScan.annotations > 0 && (
+                  <div>本文に入っている注記「（手控えに書き付けた：…）」：{cleanupScan.annotations}件（会話の発言 {cleanupScan.annotatedMessages}件）。本文から抜く（手控えは消えない）</div>
+                )}
+                {cleanupScan.total > 0 && <div>見つかった呼び出し：{cleanupScan.total}件（会話の発言 {cleanupScan.messages}件・記録帳 {cleanupScan.memories}件・回想録 {cleanupScan.retrospects}件）</div>}
                 {cleanupScan.rooms.map((r, i) => <div key={i}>・{r.name}：{r.count}件</div>)}
-                <div>救出できる手控え：{cleanupScan.rescued}件{cleanupScan.skippedDup > 0 ? `（同じ手控えが既にあるもの ${cleanupScan.skippedDup}件は保存しない）` : ""}</div>
+                {cleanupScan.total > 0 && <div>救出できる手控え：{cleanupScan.rescued}件{cleanupScan.skippedDup > 0 ? `（同じ手控えが既にあるもの ${cleanupScan.skippedDup}件は保存しない）` : ""}</div>}
                 <div className="modal-actions">
                   <button className="accent" onClick={() => setConfirmCleanup(true)}>掃除する</button>
                 </div>
@@ -3539,7 +3640,7 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
         )}
         {cleanupResult && (
           <div className="kv-row" style={{ display: "block" }}>
-            <div>掃除した。呼び出しを {cleanupResult.total}件 取り除き、手控えを {cleanupResult.rescued}件 救出した。</div>
+            <div>掃除した。{cleanupResult.annotations > 0 ? `本文の注記を ${cleanupResult.annotations}件 抜き、` : ""}呼び出しを {cleanupResult.total}件 取り除き、手控えを {cleanupResult.rescued}件 救出した。</div>
             {cleanupResult.droppedMessages > 0 && <div>（本文が呼び出しだけだった発言 {cleanupResult.droppedMessages}件は消した）</div>}
             {cleanupResult.skippedDup > 0 && <div>（同じ手控えが既にあったもの {cleanupResult.skippedDup}件は保存しなかった）</div>}
           </div>
@@ -3559,6 +3660,8 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
           <button className="danger" onClick={() => setConfirmWipe(true)}>全消去</button>
         </div>
       </div>
+
+      <div className="app-build">栞 版 {APP_BUILD}</div>
 
       {confirmDeleteKey && (
         <ConfirmDialog
@@ -3582,7 +3685,7 @@ function SettingsScreen({ apiKey, theme, priceTable, unpricedModels, onChangePri
       {confirmCleanup && (
         <ConfirmDialog
           title="書き付けを掃除する"
-          message="先に全データのバックアップを書き出してから、見つかった呼び出しを取り除き、中身を手控えに救出する。よい？"
+          message="先に全データのバックアップを書き出してから、見つかった呼び出しを取り除いて中身を手控えに救出し、本文の注記を抜く（手控えは消えない）。よい？"
           confirmLabel="掃除する"
           onCancel={() => setConfirmCleanup(false)}
           onConfirm={() => {
@@ -3973,7 +4076,8 @@ function App() {
           // 【書き付け】行・「（手控えに書き付けた：…）」の行は回想録に入れない。手控えONの部屋なら中身は手控えとして保存する
           const marked = extractJotMarkersFromContent(finalized.content, "remove");
           if (room.jotNote && marked.jotted.length > 0) addNotes(room.id, marked.jotted);
-          const text = extractPlainText(marked.content).trim();
+          // 行の途中に書かれた注記（「（手控えに書き付けた：…）」の引き写し）も記録に入れない
+          const text = extractJotAnnotations(extractPlainText(marked.content)).text.trim();
           if (!text) {
             console.warn("[書斎] 編み空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("回想録が編めなかった。もう一度試してみてほしい。", {
@@ -4051,7 +4155,8 @@ function App() {
           // （履歴の「（手控えに書き付けた：…）」を真似た行も記録帳には入れない）
           const marked = extractJotMarkersFromContent(finalized.content, "remove");
           if (room.jotNote && marked.jotted.length > 0) addNotes(room.id, marked.jotted);
-          const text = extractPlainText(marked.content).trim();
+          // 行の途中に書かれた注記（「（手控えに書き付けた：…）」の引き写し）も記録に入れない
+          const text = extractJotAnnotations(extractPlainText(marked.content)).text.trim();
           if (!text) {
             console.warn("[書斎] 綴じ空応答 stop_reason", json.stop_reason, json.usage);
             throw new ShosaiError("記録が綴られなかった。もう一度試してみてほしい。", {
